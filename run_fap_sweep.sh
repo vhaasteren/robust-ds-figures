@@ -50,7 +50,7 @@ echo
 for FAP in "${FAPS[@]}"; do
   # Tokenize FAP for folder name: 2.87e-7 -> 2p87e-7
   FTOK="${FAP//./p}"
-  OUTDIR="${OUTROOT}/${FTOK}"
+  OUTDIR="${OUTROOT}/fap_${FTOK}"
 
   echo "[run] FAP=${FAP}  ->  ${OUTDIR}"
   mkdir -p "${OUTDIR}"

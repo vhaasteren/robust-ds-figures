@@ -1,7 +1,7 @@
 {
   "meta": {
-    "generated_at": "2025-08-28 11:08:43 CEST",
-    "root": "/Users/vhaasteren/research/papers/npw-detection-statistic/scripts/atlas/fapruns",
+    "generated_at": "2025-08-28 12:09:18 CEST",
+    "root": "/Users/vhaasteren/research/code/robust-ds-figures/fapruns",
     "npsrs": 67,
     "x_grid": {
       "min": -12.0,

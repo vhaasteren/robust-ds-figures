@@ -178,7 +178,7 @@ def main() -> None:
         "mode": "npmv-fixed",
         "faprob": 1.0,
         "tau": float(args.tau),
-        "DP": None,                 # not evaluated for this placeholder
+        "DP": 1.0,                 # not evaluated for this placeholder
         "scale": 1.0,               # D_star == D_unscaled
         "npsrs": n,
         "cdf": args.cdf,
