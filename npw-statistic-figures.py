@@ -256,7 +256,7 @@ dp_np  = dp_at_fap(ds_np_cdf_h0,  ds_np_cdf_h1,  dp0, use_loglog=True)
 print('DP (npw) =', dp_npw, 'DP (def) =', dp_def, 'DP improvement =', 100*(dp_npw-dp_def)/dp_def, 'percent')
 
 # Plot an invisible dummy line to add the custom header in the legend
-ax.plot([], [], ' ', label='At ``$5$-$\sigma$" FAP of $2.87 \\times 10^{-7}$:')
+ax.plot([], [], ' ', label='At ``$5$-$\sigma$" FAP of $2.9 \\times 10^{-7}$:')
 ax.plot(1-ds_np_cdf_h0, 1-ds_np_cdf_h1, lw=2, color='0.4', label=f'NP detection probability {100*dp_np:.1f}\%')
 ax.plot(1-ds_npw_cdf_h0, 1-ds_npw_cdf_h1, lw=2, color='0', label=f'NPMV detection probability {100*dp_npw:.1f}\%')
 ax.plot(1-ds_def_cdf_h0, 1-ds_def_cdf_h1, lw=2, color='0.75', label=f'DFCC detection probability {100*dp_def:.1f}\%')
@@ -301,7 +301,7 @@ dp_npcc = dp_at_fap(ds_npcc_cdf_h0,  ds_npcc_cdf_h1,  dp0, use_loglog=True)
 #print('DP (npw) =', dp_npw, 'DP (def) =', dp_def, 'DP improvement =', 100*(dp_npw-dp_def)/dp_def, 'percent')
 
 # Plot an invisible dummy line to add the custom header in the legend
-ax.plot([], [], ' ', label='At ``$5$-$\sigma$" FAP of $2.87 \\times 10^{-7}$:')
+ax.plot([], [], ' ', label='At ``$5$-$\sigma$" FAP of $2.9 \\times 10^{-7}$:')
 ax.plot(1-ds_np_cdf_h0, 1-ds_np_cdf_h1, lw=2, color='0.4', label=f'NP detection probability {100*dp_np:.1f}\%')
 ax.plot(1-ds_npcc_cdf_h0, 1-ds_npcc_cdf_h1, lw=2, color='0.8', label=f'NPCC detection probability {100*dp_npcc:.1f}\%')
 ax.plot(1-ds_npw_cdf_h0, 1-ds_npw_cdf_h1, lw=2, color='0', ls=':', label=f'NPMV detection probability {100*dp_npw:.1f}\%')
