@@ -102,7 +102,12 @@ Notes & Conventions
      Q_star.npy       – scaled filter achieving the requested FAP at τ
      Q_unscaled.npy   – normalized filter before scaling
      result.json      – metadata (DP, scale factor, options)
-     x_opt.json       – (FULL modes) vector of optimized lower-triangular entries
+     x_opt.json       – (FULL mode) vector of optimized lower-triangular entries
+• Starting point (FULL mode), in order of priority: <outdir>/x_opt.json with
+  --resume; the vector given by --start-json; the highest-numbered
+  genx2-xopt-it*.json in the working directory (legacy); otherwise the NPMV
+  filter (or the DF filter with --no_start_from_npmv).
+• Requires nlopt (plus numpy and scipy).
 
 Cluster/Singularity Example
 ---------------------------
@@ -827,7 +832,7 @@ def atomic_save_json(path: str, obj: dict) -> None:
         tmp.flush(); os.fsync(tmp.fileno()); tmp_name = tmp.name
     os.replace(tmp_name, path)
 
-# ===================== New basis helpers =====================
+# ===================== Zonal basis helpers =====================
 
 def zonal_weights(Lmax: int) -> np.ndarray:
     """Return zonal weights w_ℓ = (2ℓ+1)/(4π) for ℓ=1..Lmax (ℓ=0 skipped)."""
@@ -1149,7 +1154,7 @@ def _run_subspace_bobyqa(x_init: np.ndarray, eval_dp, bound: float, seed: int,
                 pass
     return x
 
-# --- New Mode 2: Zonal α-aware with continuum-style constraint ---
+# --- Mode 4: Zonal α-aware with continuum-style constraint ---
 
 def optimize_zonal_alpha_aware(psrpos: np.ndarray, faprob: float, tau: float, Lmax: int,
                                seed: int, outdir: str, maxeval: int, cdf_method: str,
@@ -1240,7 +1245,7 @@ def optimize_zonal_alpha_aware(psrpos: np.ndarray, faprob: float, tau: float, Lm
     )
     return Q_star, best
 
-# --- New Mode 2: Zonal + low-rank anisotropy ---
+# --- Mode 5: Zonal + low-rank anisotropy ---
 
 def optimize_zonal_lowrank(psrpos: np.ndarray, faprob: float, tau: float, Lmax: int,
                            r_lowrank: int, seed: int, outdir: str, maxeval: int,
@@ -1331,7 +1336,7 @@ def optimize_zonal_lowrank(psrpos: np.ndarray, faprob: float, tau: float, Lmax: 
     )
     return Q_star, best
 
-# --- New Mode 3: Bi-spectral zonal spectrum ---
+# --- Mode 6: Bi-spectral zonal spectrum ---
 
 def optimize_bispectral(psrpos: np.ndarray, faprob: float, tau: float, Lmax: int,
                         kmax: int, seed: int, outdir: str, cdf_method: str,
@@ -1421,7 +1426,7 @@ def optimize_bispectral(psrpos: np.ndarray, faprob: float, tau: float, Lmax: int
     )
     return Q_star, best
 
-# ===================== New: Incremental FULL optimization =====================
+# ===================== Mode 2: Incremental FULL optimization =====================
 
 def _embed_old_into_new(Q_old: np.ndarray, n_new: int) -> np.ndarray:
     """Embed a smaller symmetric matrix into the top-left block of a larger one.
@@ -1966,7 +1971,7 @@ def main() -> None:
                         help="Disable NPMV-based initialization.")
     parser.set_defaults(start_from_npmv=True)
 
-    # NEW: resume for FULL mode
+    # resume for FULL mode
     parser.add_argument("--resume", action="store_true",
                         help="(FULL mode) Start from <outdir>/x_opt.json if present and compatible.")
 

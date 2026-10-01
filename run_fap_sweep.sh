@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
+# Sweep over target false-alarm probabilities (FAPs): run optimize-filter.py
+# once per FAP and write the results to fapruns/fap_<FAP>/. These runs are
+# the input of build_roc.sh, which builds the NPCC ROC curve.
+#
+# Usage:  bash ./run_fap_sweep.sh [path/to/optimize-filter.py]
+#         PYTHON_BIN=python3 bash ./run_fap_sweep.sh
 set -euo pipefail
 
-# Optional: pass a custom Python path or script path
+# Optional: a custom Python interpreter (PYTHON_BIN) or script path (first argument)
 PYTHON_BIN="${PYTHON_BIN:-python}"
 OPT_SCRIPT="${1:-./optimize-filter.py}"
 
@@ -30,7 +36,7 @@ FAPS=(
   "3e-1"
 )
 
-# Common flags (these are exactly the ones you said “simply work”)
+# Common optimizer flags: FULL mode, SPSA followed by a BOBYQA polish
 COMMON=(
   --mode full
   --cdf analytic
@@ -55,7 +61,7 @@ for FAP in "${FAPS[@]}"; do
   echo "[run] FAP=${FAP}  ->  ${OUTDIR}"
   mkdir -p "${OUTDIR}"
 
-  # Your known-good invocation uses --fap (not --faprob), so we keep that.
+  # --fap is an abbreviation of optimize-filter.py's --faprob option
   ${PYTHON_BIN} "${OPT_SCRIPT}" \
     "${COMMON[@]}" \
     --fap "${FAP}" \

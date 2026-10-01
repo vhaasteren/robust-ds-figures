@@ -19,6 +19,15 @@ Outputs (written to the current directory):
 The NG15 curves (DFCC, NP, NPMV) are computed here from the whitened
 deflection filter in Bmatrix.npy.gz. The toy-model curves, including NPCC,
 are read from genx2-figure-data.json (see build_npcc_roc_json.py).
+
+Usage (from the repository root; the input files are read from the current
+directory):
+
+    python3 npmv-statistic-figures.py
+
+Requirements: numpy < 2.4 (np.trapz), scipy, matplotlib, matplotlib-inline
+(the inline backend is selected below), and LaTeX for text.usetex=True (set
+it to False below if LaTeX is not available).
 """
 
 import numpy as np

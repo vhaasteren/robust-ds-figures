@@ -1,4 +1,7 @@
 #! /bin/bash
+# Build the NPCC ROC curve from the runs in ./fapruns (see run_fap_sweep.sh)
+# and write npcc-figure-data.json and genx2-figure-data.json. The latter is
+# read by npmv-statistic-figures.py.
 python ./build_npcc_roc_json.py \
   --root ./fapruns \
   --npcc-out  ./npcc-figure-data.json \

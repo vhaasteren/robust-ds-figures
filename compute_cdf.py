@@ -47,6 +47,7 @@ Usage:
 
       python3 compute_cdf.py                  # all pulsar sets
       python3 compute_cdf.py --cases 30 67    # selected pulsar sets
+      python3 compute_cdf.py --fap 1e-4       # another false-alarm probability
 
 Requirements: numpy, matplotlib, mpmath (substantially faster with the
 optional gmpy2 backend).

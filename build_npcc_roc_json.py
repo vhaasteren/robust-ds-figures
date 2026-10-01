@@ -13,6 +13,12 @@ filter that maximizes the DP at fixed FAP. Its filter depends on the FAP, so
 optimize-filter.py is run once per FAP, and the NPCC ROC curve is the envelope
 (pointwise maximum) of the ROC curves of those filters.
 
+Inputs:
+  • --root: directory with one fap_* folder per FAP, as written by
+    run_fap_sweep.sh. Each folder must contain Q_star.npy (D_star.npy for
+    runs written by earlier versions of optimize-filter.py), or a search/
+    subfolder holding the runs of run_full_npcc_search.py (its --outroot).
+
 Outputs (both are always written):
   • --npcc-out (default: ./npcc-figure-data.json)
       Envelope + per-filter diagnostic curves (FAP grid, DP, winners, sources).
@@ -34,6 +40,10 @@ Key implementation details:
        - linearly interpolate DP onto a shared FAP grid.
     The NPCC envelope is the pointwise max across these interpolated curves.
   • ds_npcc_cdf_* are produced from the envelope via: CDF = 1 - (FAP or DP).
+
+Requires numpy and scipy. build_roc.sh calls this script with the grids and
+file names used for the paper (--fig-out genx2-figure-data.json, which is the
+file read by npmv-statistic-figures.py).
 
 Example:
   python build_npcc_roc_json.py \
