@@ -1,3 +1,26 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Create the ROC figures of the paper *"Optimal robust detection statistics for
+pulsar timing arrays"*.
+
+Notation follows the paper: Q is a filter, H_N and H_S are the null (noise)
+and signal hypotheses (suffixes hN and hS below), FAP is the false-alarm
+probability and DP is the detection probability. `def` denotes the deflection
+filter DF, which equals DFCC (the literature-standard "optimal"
+cross-correlation statistic) for the CURN null hypothesis used here.
+
+Outputs (written to the current directory):
+  fig-ng15-roc-logscale.pdf     – NANOGrav 15-year model (Fig. 3 of the paper)
+  fig-ng15-roc-linearscale.pdf  – same on linear axes (not shown in the paper)
+  fig-toy-roc-linearscale.pdf   – toy model (Fig. 2 of the paper, left panel)
+  fig-toy-roc-logscale.pdf      – toy model (Fig. 2 of the paper, right panel)
+
+The NG15 curves (DFCC, NP, NPMV) are computed here from the whitened
+deflection filter in Bmatrix.npy.gz. The toy-model curves, including NPCC,
+are read from genx2-figure-data.json (see build_npcc_roc_json.py).
+"""
+
 import numpy as np
 import scipy.linalg as sl
 import scipy.integrate as sint
@@ -9,7 +32,7 @@ import pickle
 import gzip
 
 # Tweak matplotlib settings
-npw_rcparams = {
+npmv_rcparams = {
     "backend": "module://matplotlib_inline.backend_inline",
     #"backend": "pdf",
     "axes.labelsize": 20,
@@ -47,7 +70,7 @@ npw_rcparams = {
     "figure.figsize": [10.0, 7.0]}
     #"figure.figsize": [7.0, 5.0]}
 
-mpl.rcParams.update(npw_rcparams)
+mpl.rcParams.update(npmv_rcparams)
 
 # Functions for Generalized Chi-squared distributions
 def imhof(u, x, eigen_values, output='cdf'):
@@ -81,7 +104,8 @@ def get_gx2_cdf(L, Q, complex_valued=False):
     x = np.linspace(-10, 20, 200)
 
     if complex_valued:
-        ww = w.repeat(2)
+        # z ~ CN(0, C): real GX2 weights are λ/2, each with multiplicity 2.
+        ww = 0.5 * w.repeat(2)
     else:
         ww = w
 
@@ -91,39 +115,44 @@ def get_gx2_cdf(L, Q, complex_valued=False):
     return ds_an, ds_an_cdf, x, w
 
 
-def get_auc(cdf_h0, cdf_hs, skip_vals=1):
+def get_auc(cdf_hN, cdf_hS, skip_vals=1):
     """
     Calculate the Area Under the Curve (AUC) for the given CDFs.
 
-    :param cdf_h0:  H0 CDF
-    :param cdf_hs:  HS CDF
+    :param cdf_hN:  CDF under H_N
+    :param cdf_hS:  CDF under H_S
     :skip_vals:     To reduce numerical problems, we can skip edge values
     """
     # Reverse the CDFs and skip the first and last values
-    cdf_h0 = cdf_h0[::-1][skip_vals:-skip_vals]
-    cdf_hs = cdf_hs[::-1][skip_vals:-skip_vals]
+    cdf_hN = cdf_hN[::-1][skip_vals:-skip_vals]
+    cdf_hS = cdf_hS[::-1][skip_vals:-skip_vals]
 
     # Calculate AUC using trapezoidal rule
-    auc = np.trapz(1 - cdf_hs, 1 - cdf_h0)
+    auc = np.trapz(1 - cdf_hS, 1 - cdf_hN)
     return auc
 
 
 # Functions to convert filters
 def norm_filter(Q):
-    """Normalize per Equation (6), but assume whitened H0: N=I"""
+    """Normalize to unit variance of the (real-valued) statistic under H_N,
+    in the whitened basis where N = I: Var = 2 Tr(Q Q)"""
     QQ = np.dot(Q, Q)
     return Q / np.sqrt(2 * np.trace(QQ))
 
 def B_to_filters(Bmat, idx):
     """
-    Starting with 'B' from Equation (23) of van Haasteren, Allen, Romano,
-    derive all the quadratic filters
+    Starting with the whitened deflection filter B = A - I (paper section
+    "Relating DF and NP filters for realistic PTA data"), derive all the
+    quadratic filters in the whitened basis: the NP filter is A^{-1} B, and
+    the NPMV filter is the NP filter with its diagonal (per-pulsar) blocks
+    set to zero.
     """
+    # C is the whitened signal covariance (A in the paper); whitened N = I
     C = Bmat + np.identity(len(Bmat))
     L = sl.cholesky(C, lower=True)
     Q_def = norm_filter(Bmat)
 
-    # Also calculate Q_np and Q_npw
+    # Also calculate Q_np and Q_npmv
     BBi = sl.cho_solve((L, True), Bmat)
     Q_np = norm_filter(BBi)
 
@@ -132,17 +161,17 @@ def B_to_filters(Bmat, idx):
         slc = slice(idx[ii], idx[ii+1])
         BBi[slc, slc] = 0
 
-    Q_npw = norm_filter(BBi)
+    Q_npmv = norm_filter(BBi)
 
-    return C, L, Q_def, Q_np, Q_npw
+    return C, L, Q_def, Q_np, Q_npmv
 
-def dp_at_fap(cdf_h0, cdf_h1, fap0, use_loglog=True):
+def dp_at_fap(cdf_hN, cdf_hS, fap0, use_loglog=True):
     """
-    Interpolate detection probability (DP) at a target FAP (fap0) using ROC-space interpolation.
+    Interpolate detection probability (DP) at a target false-alarm probability (fap0) using ROC-space interpolation.
     By default does log–log PCHIP for stability at tiny probabilities.
     """
-    fap = 1.0 - np.asarray(cdf_h0)
-    dp  = 1.0 - np.asarray(cdf_h1)
+    fap = 1.0 - np.asarray(cdf_hN)
+    dp  = 1.0 - np.asarray(cdf_hS)
 
     # Keep finite, positive entries (needed for log-space)
     m = np.isfinite(fap) & np.isfinite(dp)
@@ -179,7 +208,7 @@ def dp_at_fap(cdf_h0, cdf_h1, fap0, use_loglog=True):
             return float(np.interp(fap0, fap, dp))
 
 
-# B of equation (23)
+# Whitened deflection filter B for the NANOGrav 15-year model
 with gzip.GzipFile('./Bmatrix.npy.gz', 'rb') as fp:
     Bmat = np.load(fp).astype(float)
 
@@ -192,36 +221,36 @@ with open('./Bmatrix-indices.json', 'r') as fp:
 # Note that ds_np is not zero-centered, because 
 # Trace(Q C) < 0 when including auto terms
 ds_def = 5.46239
-ds_npw = 3.43332
+ds_npmv = 3.43332
 ds_np = 0.51654
 
 # Form all the filters
-C, L, Q_def, Q_np, Q_npw = B_to_filters(Bmat, Bidx)
+C, L, Q_def, Q_np, Q_npmv = B_to_filters(Bmat, Bidx)
 II = np.identity(len(C))
 
 # Create the CDF curves
-ds_def_h0, ds_def_cdf_h0, x, _ = get_gx2_cdf(II, Q_def)
-ds_npw_h0, ds_npw_cdf_h0, x, _ = get_gx2_cdf(II, Q_npw)
-ds_np_h0,  ds_np_cdf_h0,  x, _ = get_gx2_cdf(II, Q_np)
-ds_def_h1, ds_def_cdf_h1, x, _ = get_gx2_cdf(L, Q_def)
-ds_npw_h1, ds_npw_cdf_h1, x, _ = get_gx2_cdf(L, Q_npw)
-ds_np_h1,  ds_np_cdf_h1,  x, _ = get_gx2_cdf(L, Q_np)
+ds_def_hN, ds_def_cdf_hN, x, _ = get_gx2_cdf(II, Q_def)
+ds_npmv_hN, ds_npmv_cdf_hN, x, _ = get_gx2_cdf(II, Q_npmv)
+ds_np_hN,  ds_np_cdf_hN,  x, _ = get_gx2_cdf(II, Q_np)
+ds_def_hS, ds_def_cdf_hS, x, _ = get_gx2_cdf(L, Q_def)
+ds_npmv_hS, ds_npmv_cdf_hS, x, _ = get_gx2_cdf(L, Q_npmv)
+ds_np_hS,  ds_np_cdf_hS,  x, _ = get_gx2_cdf(L, Q_np)
 
 # Get the AUC values
-auc_def = get_auc(ds_def_cdf_h0, ds_def_cdf_h1)
-auc_npw = get_auc(ds_npw_cdf_h0, ds_npw_cdf_h1)
-auc_np  = get_auc(ds_np_cdf_h0, ds_np_cdf_h1)
+auc_def = get_auc(ds_def_cdf_hN, ds_def_cdf_hS)
+auc_npmv = get_auc(ds_npmv_cdf_hN, ds_npmv_cdf_hS)
+auc_np  = get_auc(ds_np_cdf_hN, ds_np_cdf_hS)
 
-auc_def, auc_npw, auc_np
+auc_def, auc_npmv, auc_np
 
-# Create Figure 1
+# NG15 model ROC curves, linear scale (not shown in the paper)
 fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(8, 4.5))
 
 # Plot an invisible dummy line to get colors as below
 ax.plot([], [], ' ', label="Area under curve:")
-ax.plot(1-ds_np_cdf_h0, 1-ds_np_cdf_h1, lw=2, color='0.4',  label=f'NP AUC = {auc_np:.3f}')
-ax.plot(1-ds_npw_cdf_h0, 1-ds_npw_cdf_h1, lw=2, color='0',  label=f'NPMV AUC = {auc_npw:.3f}')
-ax.plot(1-ds_def_cdf_h0, 1-ds_def_cdf_h1, lw=2, color='0.75', label=f'DFCC AUC = {auc_def:.3f}')
+ax.plot(1-ds_np_cdf_hN, 1-ds_np_cdf_hS, lw=2, color='0.4',  label=f'NP AUC = {auc_np:.3f}')
+ax.plot(1-ds_npmv_cdf_hN, 1-ds_npmv_cdf_hS, lw=2, color='0',  label=f'NPMV AUC = {auc_npmv:.3f}')
+ax.plot(1-ds_def_cdf_hN, 1-ds_def_cdf_hS, lw=2, color='0.75', label=f'DFCC AUC = {auc_def:.3f}')
 # Diagonal “chance” line
 ax.plot([0,1], [0,1],lw=1, color='0', ls='--', label= 'Chance AUC = 0.5')
 
@@ -245,21 +274,22 @@ fig.savefig("fig-ng15-roc-linearscale.pdf", dpi=300, bbox_inches='tight')
 
 ###################################################
 
-# Create Figure 2
+# NG15 model ROC curves, log scale (Fig. 3 of the paper)
 fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(8, 4.5))
 
-dp0 = 2.87e-7
-dp_def = dp_at_fap(ds_def_cdf_h0, ds_def_cdf_h1, dp0, use_loglog=True)
-dp_npw = dp_at_fap(ds_npw_cdf_h0, ds_npw_cdf_h1, dp0, use_loglog=True)
-dp_np  = dp_at_fap(ds_np_cdf_h0,  ds_np_cdf_h1,  dp0, use_loglog=True)
+# FAP corresponding to 5 sigma, at which the detection probability (DP) is quoted
+fap_5sigma = 2.87e-7
+dp_def = dp_at_fap(ds_def_cdf_hN, ds_def_cdf_hS, fap_5sigma, use_loglog=True)
+dp_npmv = dp_at_fap(ds_npmv_cdf_hN, ds_npmv_cdf_hS, fap_5sigma, use_loglog=True)
+dp_np  = dp_at_fap(ds_np_cdf_hN,  ds_np_cdf_hS,  fap_5sigma, use_loglog=True)
 
-print('DP (npw) =', dp_npw, 'DP (def) =', dp_def, 'DP improvement =', 100*(dp_npw-dp_def)/dp_def, 'percent')
+print('DP (NPMV) =', dp_npmv, 'DP (DFCC) =', dp_def, 'DP improvement =', 100*(dp_npmv-dp_def)/dp_def, 'percent')
 
 # Plot an invisible dummy line to add the custom header in the legend
 ax.plot([], [], ' ', label='At ``$5$-$\sigma$" FAP of $2.9 \\times 10^{-7}$:')
-ax.plot(1-ds_np_cdf_h0, 1-ds_np_cdf_h1, lw=2, color='0.4', label=f'NP detection probability {100*dp_np:.1f}\%')
-ax.plot(1-ds_npw_cdf_h0, 1-ds_npw_cdf_h1, lw=2, color='0', label=f'NPMV detection probability {100*dp_npw:.1f}\%')
-ax.plot(1-ds_def_cdf_h0, 1-ds_def_cdf_h1, lw=2, color='0.75', label=f'DFCC detection probability {100*dp_def:.1f}\%')
+ax.plot(1-ds_np_cdf_hN, 1-ds_np_cdf_hS, lw=2, color='0.4', label=f'NP detection probability {100*dp_np:.1f}\%')
+ax.plot(1-ds_npmv_cdf_hN, 1-ds_npmv_cdf_hS, lw=2, color='0', label=f'NPMV detection probability {100*dp_npmv:.1f}\%')
+ax.plot(1-ds_def_cdf_hN, 1-ds_def_cdf_hS, lw=2, color='0.75', label=f'DFCC detection probability {100*dp_def:.1f}\%')
 
 ax.set_xlabel("False-alarm probability (FAP)")
 ax.set_ylabel("Detection probability")
@@ -274,38 +304,38 @@ ax.grid(True)
 fig.savefig("fig-ng15-roc-logscale.pdf", dpi=300, bbox_inches='tight')
 
 ###################################################
-# Create Figure 4
+# Toy model ROC curves, log scale (Fig. 2 of the paper, right panel)
 with open('genx2-figure-data.json', 'r') as fp:
-    fig4_data = json.load(fp)
+    toy_data = json.load(fp)
 
-# Could also re-generate the h0 and h1 CDFs, but this is faster
-# The filter matrices are in the dictionary, and are under keys:
-# 'Ddef', 'Dnpw', 'Dnp', 'Dnpcc'. Just call the get_gx2_cdf function
-ds_def_cdf_h0 = np.array(fig4_data['ds_def_cdf_h0']) 
-ds_def_cdf_h1 = np.array(fig4_data['ds_def_cdf_h1'])
-ds_npw_cdf_h0 = np.array(fig4_data['ds_npw_cdf_h0'])
-ds_npw_cdf_h1 = np.array(fig4_data['ds_npw_cdf_h1'])
-ds_np_cdf_h0 =  np.array(fig4_data['ds_np_cdf_h0'])
-ds_np_cdf_h1 =  np.array(fig4_data['ds_np_cdf_h1'])
-ds_npcc_cdf_h0 = np.array(fig4_data['ds_npcc_cdf_h0'])
-ds_npcc_cdf_h1 = np.array(fig4_data['ds_npcc_cdf_h1'])
+# Could also re-generate the H_N and H_S CDFs, but this is faster
+# The (DF, NPMV, NP) filter matrices are in the dictionary, under keys:
+# 'Qdef', 'Qnpmv', 'Qnp'. Just call the get_gx2_cdf function
+ds_def_cdf_hN = np.array(toy_data['ds_def_cdf_hN']) 
+ds_def_cdf_hS = np.array(toy_data['ds_def_cdf_hS'])
+ds_npmv_cdf_hN = np.array(toy_data['ds_npmv_cdf_hN'])
+ds_npmv_cdf_hS = np.array(toy_data['ds_npmv_cdf_hS'])
+ds_np_cdf_hN =  np.array(toy_data['ds_np_cdf_hN'])
+ds_np_cdf_hS =  np.array(toy_data['ds_np_cdf_hS'])
+ds_npcc_cdf_hN = np.array(toy_data['ds_npcc_cdf_hN'])
+ds_npcc_cdf_hS = np.array(toy_data['ds_npcc_cdf_hS'])
 
 fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(8, 4.5))
 
-dp0 = 2.87e-7
-dp_def  = dp_at_fap(ds_def_cdf_h0, ds_def_cdf_h1, dp0, use_loglog=True)
-dp_npw  = dp_at_fap(ds_npw_cdf_h0, ds_npw_cdf_h1, dp0, use_loglog=True)
-dp_np   = dp_at_fap(ds_np_cdf_h0,  ds_np_cdf_h1,  dp0, use_loglog=True)
-dp_npcc = dp_at_fap(ds_npcc_cdf_h0,  ds_npcc_cdf_h1,  dp0, use_loglog=True)
+fap_5sigma = 2.87e-7
+dp_def  = dp_at_fap(ds_def_cdf_hN, ds_def_cdf_hS, fap_5sigma, use_loglog=True)
+dp_npmv  = dp_at_fap(ds_npmv_cdf_hN, ds_npmv_cdf_hS, fap_5sigma, use_loglog=True)
+dp_np   = dp_at_fap(ds_np_cdf_hN,  ds_np_cdf_hS,  fap_5sigma, use_loglog=True)
+dp_npcc = dp_at_fap(ds_npcc_cdf_hN,  ds_npcc_cdf_hS,  fap_5sigma, use_loglog=True)
 
-#print('DP (npw) =', dp_npw, 'DP (def) =', dp_def, 'DP improvement =', 100*(dp_npw-dp_def)/dp_def, 'percent')
+#print('DP (NPMV) =', dp_npmv, 'DP (DFCC) =', dp_def, 'DP improvement =', 100*(dp_npmv-dp_def)/dp_def, 'percent')
 
 # Plot an invisible dummy line to add the custom header in the legend
 ax.plot([], [], ' ', label='At ``$5$-$\sigma$" FAP of $2.9 \\times 10^{-7}$:')
-ax.plot(1-ds_np_cdf_h0, 1-ds_np_cdf_h1, lw=2, color='0.4', label=f'NP detection probability {100*dp_np:.1f}\%')
-ax.plot(1-ds_npcc_cdf_h0, 1-ds_npcc_cdf_h1, lw=2, color='0.8', label=f'NPCC detection probability {100*dp_npcc:.1f}\%')
-ax.plot(1-ds_npw_cdf_h0, 1-ds_npw_cdf_h1, lw=2, color='0', ls=':', label=f'NPMV detection probability {100*dp_npw:.1f}\%')
-ax.plot(1-ds_def_cdf_h0, 1-ds_def_cdf_h1, lw=2, color='0.75', label=f'DFCC detection probability {100*dp_def:.1f}\%')
+ax.plot(1-ds_np_cdf_hN, 1-ds_np_cdf_hS, lw=2, color='0.4', label=f'NP detection probability {100*dp_np:.1f}\%')
+ax.plot(1-ds_npcc_cdf_hN, 1-ds_npcc_cdf_hS, lw=2, color='0.8', label=f'NPCC detection probability {100*dp_npcc:.1f}\%')
+ax.plot(1-ds_npmv_cdf_hN, 1-ds_npmv_cdf_hS, lw=2, color='0', ls=':', label=f'NPMV detection probability {100*dp_npmv:.1f}\%')
+ax.plot(1-ds_def_cdf_hN, 1-ds_def_cdf_hS, lw=2, color='0.75', label=f'DFCC detection probability {100*dp_def:.1f}\%')
 
 ax.set_xlabel("False-alarm probability (FAP)")
 ax.set_ylabel("Detection probability")
@@ -320,23 +350,23 @@ fig.savefig("fig-toy-roc-logscale.pdf", dpi=300, bbox_inches='tight')
 
 
 ###############################################################
-# Create Figure 5
+# Toy model ROC curves, linear scale (Fig. 2 of the paper, left panel)
 # Get the AUC values
-auc_def = get_auc(ds_def_cdf_h0, ds_def_cdf_h1)
-auc_npw = get_auc(ds_npw_cdf_h0, ds_npw_cdf_h1)
-auc_npcc = get_auc(ds_npcc_cdf_h0, ds_npcc_cdf_h1)
-auc_np  = get_auc(ds_np_cdf_h0, ds_np_cdf_h1)
+auc_def = get_auc(ds_def_cdf_hN, ds_def_cdf_hS)
+auc_npmv = get_auc(ds_npmv_cdf_hN, ds_npmv_cdf_hS)
+auc_npcc = get_auc(ds_npcc_cdf_hN, ds_npcc_cdf_hS)
+auc_np  = get_auc(ds_np_cdf_hN, ds_np_cdf_hS)
 
-auc_def, auc_npw, auc_npcc, auc_np
+auc_def, auc_npmv, auc_npcc, auc_np
 
 fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(8, 4.5))
 
 # Plot an invisible dummy line to get colors as below
 ax.plot([], [], ' ', label="Area under curve:")
-ax.plot(1-ds_np_cdf_h0, 1-ds_np_cdf_h1, lw=2, color='0.4',  label=f'NP AUC = {auc_np:.3f}')
-ax.plot(1-ds_npcc_cdf_h0, 1-ds_npcc_cdf_h1, lw=2, color='0.8',  label=f'NPCC AUC = {auc_npcc:.3f}')
-ax.plot(1-ds_npw_cdf_h0, 1-ds_npw_cdf_h1, lw=2, ls=':', color='0',  label=f'NPMV AUC = {auc_npw:.3f}')
-ax.plot(1-ds_def_cdf_h0, 1-ds_def_cdf_h1, lw=2, color='0.75', label=f'DFCC AUC = {auc_def:.3f}')
+ax.plot(1-ds_np_cdf_hN, 1-ds_np_cdf_hS, lw=2, color='0.4',  label=f'NP AUC = {auc_np:.3f}')
+ax.plot(1-ds_npcc_cdf_hN, 1-ds_npcc_cdf_hS, lw=2, color='0.8',  label=f'NPCC AUC = {auc_npcc:.3f}')
+ax.plot(1-ds_npmv_cdf_hN, 1-ds_npmv_cdf_hS, lw=2, ls=':', color='0',  label=f'NPMV AUC = {auc_npmv:.3f}')
+ax.plot(1-ds_def_cdf_hN, 1-ds_def_cdf_hS, lw=2, color='0.75', label=f'DFCC AUC = {auc_def:.3f}')
 # Diagonal “chance” line
 ax.plot([0,1], [0,1],lw=1, color='0', ls='--', label= 'Chance AUC = 0.5')
 

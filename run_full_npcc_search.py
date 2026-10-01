@@ -3,6 +3,12 @@
 """
 Global-ish search driver for the FULL problem (high-D).
 
+Searches for the NPCC filter of the paper *"Optimal robust detection statistics
+for pulsar timing arrays"*: the zero-diagonal (cross-correlation-only) filter
+that maximizes the detection probability (DP) at a fixed false-alarm
+probability (FAP). NPMV is the Neyman–Pearson-Minimum-Variance filter, used as
+the default starting point.
+
 Usage (typical):
   python run_full_npcc_search.py \
     --optimize-filter ./optimize-filter.py \

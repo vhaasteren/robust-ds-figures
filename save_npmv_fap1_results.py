@@ -3,15 +3,21 @@
 """
 Write NPMV artifacts for FAP=1 into ./fapruns/fap_1/
 
+NPMV is the Neyman–Pearson-Minimum-Variance filter of the paper *"Optimal
+robust detection statistics for pulsar timing arrays"*. Notation follows the
+paper: Q is a filter, N and S are the covariances under the null (H_N) and
+signal (H_S) hypotheses, FAP is the false-alarm probability and DP is the
+detection probability.
+
 Outputs:
-  D_unscaled.npy  – NPMV normalized under the N-inner product
-  D_star.npy      – identical to D_unscaled (scale = 1.0 for FAP=1 placeholder)
-  x_opt.json      – strict lower-triangular vector of D_unscaled
+  Q_unscaled.npy  – NPMV filter normalized under the N-inner product
+  Q_star.npy      – identical to Q_unscaled (scale = 1.0 for FAP=1 placeholder)
+  x_opt.json      – strict lower-triangular vector of Q_unscaled
   result.json     – lightweight metadata (mode=npmv-fixed, faprob=1.0)
 
 Notes:
-- Uses the same NG15yr pulsar subset and HD kernel as optimize-filter.py.
-- Default npsrs=67 to match your typical runs; override via --npsrs if needed.
+- Uses the same NG15yr pulsar subset and HD matrix as optimize-filter.py.
+- Default npsrs=67 to match the paper's toy model; override via --npsrs if needed.
 """
 
 from __future__ import annotations
@@ -97,7 +103,7 @@ psrs_pos_15yr = np.array([
     [ 0.92132969, -0.15264057,  0.35756462]
 ])
 
-# ---------------- Utilities (HD kernel, covariances, normalization) ----------------
+# ---------------- Utilities (HD matrix, covariances, normalization) ----------------
 
 def hdcorrmat(psrpos: np.ndarray, psrTerm: bool = True) -> np.ndarray:
     """Hellings–Downs correlation matrix (safe logs) with optional pulsar term on diag."""
@@ -111,12 +117,12 @@ def hdcorrmat(psrpos: np.ndarray, psrTerm: bool = True) -> np.ndarray:
     return logxp - 0.25 * xp + 0.5 + coeff * np.eye(len(cosgamma))
 
 def get_cov_matrices(h: float, hdmat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """C0 (CURN) and C = I + h^2*HD for h=1."""
+    """N (CURN null hypothesis H_N) and S = I + h^2*HD (signal hypothesis H_S) for h=1."""
     C_noise = np.identity(len(hdmat))
     C_signal = (h**2) * hdmat
-    C0 = C_noise + np.diag(np.diag(C_signal))  # CURN
-    C  = C_noise + C_signal
-    return C0, C
+    N = C_noise + np.diag(np.diag(C_signal))  # CURN
+    S = C_noise + C_signal
+    return N, S
 
 def norm_filter_N(Q: np.ndarray, N: np.ndarray) -> np.ndarray:
     """Normalize Q by the N-inner product: Q / sqrt(tr(Q N Q N))."""
@@ -125,9 +131,9 @@ def norm_filter_N(Q: np.ndarray, N: np.ndarray) -> np.ndarray:
         raise ValueError("Non-positive norm for filter.")
     return Q / np.sqrt(nrm2)
 
-def get_lower_triangular_elements(D: np.ndarray) -> np.ndarray:
-    i, j = np.tril_indices(D.shape[0], k=-1)
-    return D[i, j]
+def get_lower_triangular_elements(Q: np.ndarray) -> np.ndarray:
+    i, j = np.tril_indices(Q.shape[0], k=-1)
+    return Q[i, j]
 
 # ---------------- Main: build & save NPMV artifacts ----------------
 
@@ -146,43 +152,44 @@ def main() -> None:
 
     psrpos = psrs_pos_15yr[:n, :]
     hd = hdcorrmat(psrpos, psrTerm=True)
-    C0, C = get_cov_matrices(1.0, hd)
-    L0 = np.diag(np.sqrt(np.diag(C0)))          # H0 whitening factor
-    L1 = sl.cholesky(C, lower=True)             # H1 Cholesky (for info; not used in outputs)
-    N  = L0 @ L0.T
+    N, S = get_cov_matrices(1.0, hd)
+    LN = np.diag(np.sqrt(np.diag(N)))           # H_N whitening factor
+    LS = sl.cholesky(S, lower=True)             # H_S Cholesky factor
+    N_ip = LN @ LN.T                            # inner-product metric (N rebuilt from LN, as in optimize-filter.py)
 
-    # NP filter: Q_np = C0^{-1} - C^{-1}; NPMV = off-diagonal of Q_np
-    C0_inv = np.diag(1.0 / np.diag(C0))
-    Q_np = C0_inv - sl.cho_solve((L1, True), np.eye(n))
+    # NP filter: Q_np = N^{-1} - S^{-1}. NPMV: for the diagonal N used here,
+    # Q_np with its diagonal set to zero
+    N_inv = np.diag(1.0 / np.diag(N))
+    Q_np = N_inv - sl.cho_solve((LS, True), np.eye(n))
     Q_npmv = Q_np.copy()
     np.fill_diagonal(Q_npmv, 0.0)
 
     # Normalize in N-inner product
-    D_unscaled = norm_filter_N(Q_npmv, N)
-    D_star = D_unscaled.copy()   # For FAP=1 placeholder we set scale=1
+    Q_unscaled = norm_filter_N(Q_npmv, N_ip)
+    Q_star = Q_unscaled.copy()   # For FAP=1 placeholder we set scale=1
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     # Save matrices
-    np.save(outdir / "D_unscaled.npy", D_unscaled)
-    np.save(outdir / "D_star.npy", D_star)
+    np.save(outdir / "Q_unscaled.npy", Q_unscaled)
+    np.save(outdir / "Q_star.npy", Q_star)
 
     # Save vectorized parameters (strict lower triangle)
-    x_vec = get_lower_triangular_elements(D_unscaled).tolist()
+    x_vec = get_lower_triangular_elements(Q_unscaled).tolist()
     with open(outdir / "x_opt.json", "w") as fp:
         json.dump(x_vec, fp, indent=2)
 
-    # Save a minimal result.json compatible with your tooling
+    # Save a minimal result.json compatible with build_npcc_roc_json.py
     meta = {
         "mode": "npmv-fixed",
         "faprob": 1.0,
         "tau": float(args.tau),
-        "DP": 1.0,                 # not evaluated for this placeholder
-        "scale": 1.0,               # D_star == D_unscaled
+        "DP": 1.0,                 # detection probability; not evaluated for this placeholder
+        "scale": 1.0,               # Q_star == Q_unscaled
         "npsrs": n,
         "cdf": args.cdf,
-        "note": "NPMV (off-diagonal NP) saved without scaling; placeholder for FAP=1."
+        "note": "NPMV filter saved without scaling; placeholder for FAP=1."
     }
     with open(outdir / "result.json", "w") as fp:
         json.dump(meta, fp, indent=2)

@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Build NPCC ROC envelope JSON + baseline curves (DFCC, NPMV, NP) in one pass.
+Build the ROC curve of the NPCC statistic + baseline curves (DFCC, NPMV, NP) in one pass.
+
+Notation follows the paper *"Optimal robust detection statistics for pulsar
+timing arrays"*: Q is a filter, H_N and H_S are the null (noise) and signal
+hypotheses with covariances N and S, FAP is the false-alarm probability and
+DP is the detection probability.
+
+NPCC is the cross-correlation-only Neyman–Pearson statistic: the zero-diagonal
+filter that maximizes the DP at fixed FAP. Its filter depends on the FAP, so
+optimize-filter.py is run once per FAP, and the NPCC ROC curve is the envelope
+(pointwise maximum) of the ROC curves of those filters.
 
 Outputs (both are always written):
   • --npcc-out (default: ./npcc-figure-data.json)
       Envelope + per-filter diagnostic curves (FAP grid, DP, winners, sources).
   • --fig-out (default: ./genx2-optimized-figure-data.json)
-      Baseline CDFs + NPCC CDFs, ready for figure scripts:
-         - ds_def_cdf_h0, ds_def_cdf_h1
-         - ds_npw_cdf_h0, ds_npw_cdf_h1
-         - ds_np_cdf_h0,  ds_np_cdf_h1
-         - ds_npcc_cdf_h0, ds_npcc_cdf_h1   <-- NEW (CDFs; plot 1 - these)
-         - Ddef, Dnpw, Dnp  (normalized matrices for reference)
+      Baseline CDFs + NPCC CDFs under H_N (hN) and H_S (hS), ready for the figure script:
+         - ds_def_cdf_hN,  ds_def_cdf_hS    (deflection filter DF = DFCC for the CURN null)
+         - ds_npmv_cdf_hN, ds_npmv_cdf_hS
+         - ds_np_cdf_hN,   ds_np_cdf_hS
+         - ds_npcc_cdf_hN, ds_npcc_cdf_hS   (CDFs; plot 1 - these)
+         - Qdef, Qnpmv, Qnp  (normalized filter matrices for reference)
 
 Key implementation details:
-  • Uses the same NG15yr pulsar subset and HD kernel as optimize-filter.py.
-  • Always duplicates eigenvalues with .repeat(2) (complex-valued toy model).
+  • Uses the same NG15yr pulsar subset and HD matrix as optimize-filter.py.
+  • Complex toy model: eigenvalues λ of L^T Q L enter Imhof as weights λ/2, twice each.
   • For each optimized run (each fap_* folder), we:
-       - build CDFs under H0/H1 over a τ-grid,
+       - build CDFs under H_N/H_S over a τ-grid,
        - convert to (FAP, DP) curves,
        - sort by FAP, de-duplicate, enforce monotone DP via cumulative max,
        - linearly interpolate DP onto a shared FAP grid.
@@ -122,7 +132,7 @@ psrs_pos_15yr = np.array([
 ])
 
 
-# ===================== HD kernel & covariances =====================
+# ===================== HD matrix & covariances =====================
 
 def hdcorrmat(psrpos: np.ndarray, psrTerm: bool = True) -> np.ndarray:
     """Hellings–Downs correlation matrix (safe logs) with optional pulsar term on diag."""
@@ -137,12 +147,12 @@ def hdcorrmat(psrpos: np.ndarray, psrTerm: bool = True) -> np.ndarray:
 
 
 def get_cov_matrices(h: float, hdmat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """C0 (CURN) and C = I + h^2 * HD for h=1."""
+    """N (CURN null hypothesis H_N) and S = I + h^2 * HD (signal hypothesis H_S) for h=1."""
     C_noise = np.identity(len(hdmat))
     C_signal = (h**2) * hdmat
-    C0 = C_noise + np.diag(np.diag(C_signal))  # CURN
-    C  = C_noise + C_signal
-    return C0, C
+    N = C_noise + np.diag(np.diag(C_signal))  # CURN
+    S  = C_noise + C_signal
+    return N, S
 
 
 # ===================== Canonical filters & normalization =====================
@@ -156,26 +166,30 @@ def norm_filter_N(Q: np.ndarray, N: np.ndarray) -> np.ndarray:
 
 
 def get_all_filters(h: float, hdmat: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Build NP, NPMV (off-diag of NP), DF filters and Cholesky factors."""
-    C0, CS = get_cov_matrices(h, hdmat=hdmat)
-    L0 = np.diag(np.sqrt(np.diag(C0)))  # whitening factor for H0
-    L1 = sl.cholesky(CS, lower=True)
-    C0_inv = np.diag(1/np.diag(C0))
+    """Build NP, NPMV, DF filters and Cholesky factors (N = LN LN^T, S = LS LS^T).
 
-    DNP  = C0_inv - sl.cho_solve((L1, True), np.identity(len(CS)))
-    DNPW = DNP.copy(); np.fill_diagonal(DNPW, 0)
-    DDEF = C0_inv @ (CS - C0) @ C0_inv
+    For the diagonal N used here, NPMV is the NP filter with its diagonal set
+    to zero, and the deflection filter DF (QDEF) equals DFCC.
+    """
+    N, S = get_cov_matrices(h, hdmat=hdmat)
+    LN = np.diag(np.sqrt(np.diag(N)))  # whitening factor for H_N
+    LS = sl.cholesky(S, lower=True)
+    N_inv = np.diag(1/np.diag(N))
 
-    DNPW = norm_filter_N(DNPW, C0)
-    DNP  = norm_filter_N(DNP , C0)
-    DDEF = norm_filter_N(DDEF, C0)
-    return DNP, DNPW, DDEF, L0, L1
+    QNP  = N_inv - sl.cho_solve((LS, True), np.identity(len(S)))
+    QNPMV = QNP.copy(); np.fill_diagonal(QNPMV, 0)
+    QDEF = N_inv @ (S - N) @ N_inv
+
+    QNPMV = norm_filter_N(QNPMV, N)
+    QNP  = norm_filter_N(QNP , N)
+    QDEF = norm_filter_N(QDEF, N)
+    return QNP, QNPMV, QDEF, LN, LS
 
 
-# ===================== GX^2 CDF via Imhof (with complex duplication) =====================
+# ===================== GX^2 CDF via Imhof (complex-valued data) =====================
 
 def _imhof_integrand(u: float, x: float, eigs: np.ndarray) -> float:
-    """Scalar Imhof integrand at frequency u for threshold x and eigenvalues eigs (duplicated externally)."""
+    """Scalar Imhof integrand at frequency u for threshold x and real-form weights eigs (λ/2, each twice, for complex data)."""
     theta = 0.5 * np.sum(np.arctan(eigs * u)) - 0.5 * x * u
     rho   = np.prod((1.0 + (eigs * u)**2)**0.25)
     if u == 0.0:
@@ -185,7 +199,7 @@ def _imhof_integrand(u: float, x: float, eigs: np.ndarray) -> float:
 
 def gx2cdf_from_eigs(evals: np.ndarray, xs: np.ndarray,
                      cutoff: float = 1e-6, limit: int = 200, epsabs: float = 1e-9) -> np.ndarray:
-    """Imhof CDF for a vector of thresholds xs, with optional small-|λ| cutoff. evals must already be duplicated if complex."""
+    """Imhof CDF for a vector of thresholds xs, with optional small-|λ| cutoff. For complex data, evals must already be the real-form weights (λ/2, each twice)."""
     w = np.asarray(evals, dtype=float)
     if cutoff > 0:
         w = w[np.abs(w) > cutoff]
@@ -202,9 +216,16 @@ def gx2cdf_from_eigs(evals: np.ndarray, xs: np.ndarray,
 
 def get_gx2_cdf(L: np.ndarray, Q: np.ndarray, xs: np.ndarray,
                 cutoff: float = 1e-6, limit: int = 200, epsabs: float = 1e-9) -> np.ndarray:
-    """Helper: CDF of z^T Q z with z ~ N(0, I) after linear map L. Duplicates eigenvalues (complex toy model)."""
-    w = sl.eigvalsh(L.T @ Q @ L).repeat(2)
-    return gx2cdf_from_eigs(w, xs, cutoff=cutoff, limit=limit, epsabs=epsabs)
+    """CDF of z† Q z for z ~ CN(0, I) after the linear map L.
+
+    Eigenvalues λ of L^T Q L are the complex-normal weights. The equivalent
+    real generalized-chi-squared uses weight λ/2 with multiplicity 2.
+    """
+    w = sl.eigvalsh(L.T @ Q @ L)
+    if cutoff > 0:
+        w = w[np.abs(w) > cutoff]
+    w = np.repeat(w, 2) * 0.5
+    return gx2cdf_from_eigs(w, xs, cutoff=0.0, limit=limit, epsabs=epsabs)
 
 
 # ===================== Filesystem helpers for per-FAP runs =====================
@@ -231,13 +252,22 @@ def _parse_fap_from_folder(name: str) -> Optional[float]:
             return None
 
 
+def _scaled_filter_path(outdir: Path) -> Optional[Path]:
+    """Path of the scaled filter of a run: Q_star.npy (D_star.npy for runs
+    written by earlier versions of optimize-filter.py), or None if missing."""
+    for name in ("Q_star.npy", "D_star.npy"):
+        if (outdir / name).exists():
+            return outdir / name
+    return None
+
+
 def _pick_best_subrun(fap_dir: Path) -> Optional[Path]:
     """Priority:
-       1) If top-level D_star.npy exists, return fap_dir itself (finished)
+       1) If top-level Q_star.npy exists, return fap_dir itself (finished)
        2) search/best if exists
        3) highest-DP result.json under search/ensemble
     """
-    if (fap_dir / "D_star.npy").exists():
+    if _scaled_filter_path(fap_dir) is not None:
         return fap_dir
 
     best = fap_dir / "search" / "best"
@@ -276,25 +306,25 @@ def build_curve_for_outdir(outdir: Path,
                            cutoff: float, limit: int, epsabs: float
                            ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """Return (FAP_sorted, DP_monotone, meta) for one optimized run outdir."""
-    Dp = outdir / "D_star.npy"
-    if not Dp.exists():
-        raise FileNotFoundError(f"Missing D_star.npy in {outdir}")
-    D = np.load(Dp)
-    n = D.shape[0]
+    Qpath = _scaled_filter_path(outdir)
+    if Qpath is None:
+        raise FileNotFoundError(f"Missing Q_star.npy in {outdir}")
+    Q = np.load(Qpath)
+    n = Q.shape[0]
 
-    # Build L0, L1 consistent with optimize-filter
+    # Build LN, LS consistent with optimize-filter
     psrpos = psrs_pos_15yr[:n, :]
     hd = hdcorrmat(psrpos, psrTerm=True)
-    C0, C = get_cov_matrices(1.0, hd)
-    L0 = np.diag(np.sqrt(np.diag(C0)))
-    L1 = sl.cholesky(C, lower=True)
+    N, S = get_cov_matrices(1.0, hd)
+    LN = np.diag(np.sqrt(np.diag(N)))
+    LS = sl.cholesky(S, lower=True)
 
     # CDFs along τ-grid
-    cdf0 = get_gx2_cdf(L0, D, xs, cutoff=cutoff, limit=limit, epsabs=epsabs)
-    cdf1 = get_gx2_cdf(L1, D, xs, cutoff=cutoff, limit=limit, epsabs=epsabs)
+    cdf_N = get_gx2_cdf(LN, Q, xs, cutoff=cutoff, limit=limit, epsabs=epsabs)
+    cdf_S = get_gx2_cdf(LS, Q, xs, cutoff=cutoff, limit=limit, epsabs=epsabs)
 
-    fap = 1.0 - cdf0
-    dp  = 1.0 - cdf1
+    fap = 1.0 - cdf_N
+    dp  = 1.0 - cdf_S
 
     # Sort by FAP, de-duplicate FAPs (keep max DP for each FAP), then enforce monotone DP
     order = np.argsort(fap)
@@ -337,7 +367,7 @@ def build_envelope_on_grid(fap_grid: np.ndarray,
 # ===================== CLI & main =====================
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build NPCC ROC envelope + baseline curves JSON.")
+    ap = argparse.ArgumentParser(description="Build NPCC ROC curve (envelope of per-FAP filters) + baseline curves JSON.")
     ap.add_argument("--root", type=str, required=True,
                     help="Root directory containing fap_* folders (e.g., /data/runs/npcc_fap_sweep).")
 
@@ -381,19 +411,19 @@ def main() -> None:
     n = int(args.npsrs)
     psrpos = psrs_pos_15yr[:n, :]
     hdmat = hdcorrmat(psrpos, psrTerm=True)
-    DNP, DNPW, DDEF, L0, L1 = get_all_filters(1.0, hdmat)
-    C0 = L0 @ L0.T
+    QNP, QNPMV, QDEF, LN, LS = get_all_filters(1.0, hdmat)
+    N = LN @ LN.T
 
     xs = np.linspace(args.x_min, args.x_max, args.nx)
 
-    # Baseline CDFs (always duplicate eigenvalues for toy model)
-    ds_def_cdf_h0 = get_gx2_cdf(L0, DDEF, xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
-    ds_npw_cdf_h0 = get_gx2_cdf(L0, DNPW, xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
-    ds_np_cdf_h0  = get_gx2_cdf(L0, DNP , xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
+    # Baseline CDFs under H_N and H_S (complex-valued toy model)
+    ds_def_cdf_hN = get_gx2_cdf(LN, QDEF, xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
+    ds_npmv_cdf_hN = get_gx2_cdf(LN, QNPMV, xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
+    ds_np_cdf_hN  = get_gx2_cdf(LN, QNP , xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
 
-    ds_def_cdf_h1 = get_gx2_cdf(L1, DDEF, xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
-    ds_npw_cdf_h1 = get_gx2_cdf(L1, DNPW, xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
-    ds_np_cdf_h1  = get_gx2_cdf(L1, DNP , xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
+    ds_def_cdf_hS = get_gx2_cdf(LS, QDEF, xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
+    ds_npmv_cdf_hS = get_gx2_cdf(LS, QNPMV, xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
+    ds_np_cdf_hS  = get_gx2_cdf(LS, QNP , xs, cutoff=args.cutoff, limit=args.limit, epsabs=args.epsabs)
 
     # -------- Discover per-FAP runs, build per-run curves, interpolate, envelope --------
     fap_dirs = [p for p in sorted(root.iterdir()) if p.is_dir() and p.name.startswith("fap_")]
@@ -451,7 +481,7 @@ def main() -> None:
                 "scale": float(meta.get("scale", np.nan)),
                 "outdir": str(outdir)
             }
-            print(f"[curve] {tok}: built & interpolated (n={np.load(outdir/'D_star.npy').shape[0]}), "
+            print(f"[curve] {tok}: built & interpolated (n={np.load(_scaled_filter_path(outdir)).shape[0]}), "
                   f"DP_reported={meta.get('DP','?')}, scale={meta.get('scale','?')}")
         except Exception as e:
             print(f"[warn] Failed to build curve for {tok} at {outdir}: {e}")
@@ -501,9 +531,9 @@ def main() -> None:
     print(f"[done] Wrote NPCC diagnostics JSON: {npcc_out}")
 
     # -------- Write figure JSON (baseline + NPCC CDFs) --------
-    # Convert envelope to CDF arrays for plotting (your figure scripts plot 1 - CDF)
-    ds_npcc_cdf_h0 = (1.0 - fap_env).tolist()[::-1]  # since FAP = 1 - CDF_H0
-    ds_npcc_cdf_h1 = (1.0 - dp_env ).tolist()[::-1]  # since  DP = 1 - CDF_H1
+    # Convert envelope to CDF arrays for plotting (the figure script plots 1 - CDF)
+    ds_npcc_cdf_hN = (1.0 - fap_env).tolist()[::-1]  # since FAP = 1 - CDF under H_N
+    ds_npcc_cdf_hS = (1.0 - dp_env ).tolist()[::-1]  # since  DP = 1 - CDF under H_S
 
     fig_payload = {
         "meta": {
@@ -513,20 +543,20 @@ def main() -> None:
             "x_grid": {"min": args.x_min, "max": args.x_max, "nx": args.nx},
             "imhof": {"cutoff": args.cutoff, "limit": args.limit, "epsabs": args.epsabs},
         },
-        # Baseline CDFs (arrays; you’ll plot 1 - these)
-        "ds_def_cdf_h0": ds_def_cdf_h0.tolist(),
-        "ds_def_cdf_h1": ds_def_cdf_h1.tolist(),
-        "ds_npw_cdf_h0": ds_npw_cdf_h0.tolist(),
-        "ds_npw_cdf_h1": ds_npw_cdf_h1.tolist(),
-        "ds_np_cdf_h0":  ds_np_cdf_h0.tolist(),
-        "ds_np_cdf_h1":  ds_np_cdf_h1.tolist(),
+        # Baseline CDFs (arrays; plot 1 - these)
+        "ds_def_cdf_hN": ds_def_cdf_hN.tolist(),
+        "ds_def_cdf_hS": ds_def_cdf_hS.tolist(),
+        "ds_npmv_cdf_hN": ds_npmv_cdf_hN.tolist(),
+        "ds_npmv_cdf_hS": ds_npmv_cdf_hS.tolist(),
+        "ds_np_cdf_hN":  ds_np_cdf_hN.tolist(),
+        "ds_np_cdf_hS":  ds_np_cdf_hS.tolist(),
         # NPCC envelope as CDF arrays
-        "ds_npcc_cdf_h0": ds_npcc_cdf_h0,
-        "ds_npcc_cdf_h1": ds_npcc_cdf_h1,
-        # Reference normalized matrices (N-inner product)
-        "Ddef": DDEF.tolist(),
-        "Dnpw": DNPW.tolist(),
-        "Dnp":  DNP.tolist(),
+        "ds_npcc_cdf_hN": ds_npcc_cdf_hN,
+        "ds_npcc_cdf_hS": ds_npcc_cdf_hS,
+        # Reference normalized filter matrices (N-inner product)
+        "Qdef": QDEF.tolist(),
+        "Qnpmv": QNPMV.tolist(),
+        "Qnp":  QNP.tolist(),
     }
 
     fig_out.parent.mkdir(parents=True, exist_ok=True)

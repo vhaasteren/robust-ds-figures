@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Optimize quadratic decision filters for PTA detection using a GX^2 CDF.
+Optimize the filter of a quadratic detection statistic for PTAs using a GX^2 CDF.
 
 Overview
 --------
-This program optimizes a quadratic decision statistic
-    T = z^T D z
+This program optimizes the filter Q of a quadratic detection statistic
+    D(z|Q) = z† Q z
 for detecting a correlated stochastic signal (e.g., a GWB) in pulsar timing
-array (PTA) data. The matrix `D` is a symmetric, zero-diagonal "filter" in the
-space of pulsars. Given a target false-alarm probability (FAP) at a fixed
-threshold τ, we scale an (optionally optimized) normalized filter D so that
-the statistic under H0 (noise+auto terms) achieves the desired FAP; the
-detection probability (DP) is then computed under H1 (noise+HD correlation).
+array (PTA) data. We follow the notation of the paper *"Optimal robust
+detection statistics for pulsar timing arrays"*: D is the statistic, Q is the
+filter. The matrix `Q` is a symmetric, zero-diagonal filter in the space of
+pulsars, so the statistic uses only cross-correlations. Given a target
+false-alarm probability (FAP) at a fixed threshold τ, we scale an (optionally
+optimized) normalized filter Q so that the statistic under the null hypothesis
+H_N (noise + GWB autocorrelations, i.e. CURN) achieves the desired FAP; the
+detection probability (DP) is then computed under the signal hypothesis H_S
+(noise + full HD correlations).
 
-Two CDF backends are available for evaluating the quadratic form distribution
-of T under H0 and H1:
-  • `analytic` – a fast analytic series (central, complex-valued),
+Maximizing the DP at fixed FAP over all zero-diagonal filters (FULL mode)
+gives the NPCC filter of the paper: the cross-correlation-only Neyman–Pearson
+statistic. Its shape depends on the FAP, so it is optimized once per FAP.
+
+Two CDF backends are available for evaluating the distribution of the
+quadratic form D under H_N and H_S:
+  • `analytic` – the closed-form CDF F(τ, C, Q) for complex-valued data,
+                 evaluated in double precision,
   • `imhof` – Imhof’s method (robust numerical integration; slower).
 
-You can optimize D in several modes:
-  1) FULL                – free off-diagonals in D (default; many optimizers)
+You can optimize Q in several modes:
+  1) FULL                – free off-diagonals in Q (default; many optimizers)
   2) FULL-INCREMENTAL    – grow the problem size progressively
   3) LEGENDRE            – optimize in a zonal Legendre basis
   4) ZONAL-ALPHA-AWARE   – zonal basis with a continuum-style constraint
@@ -36,13 +45,24 @@ The FULL mode supports multiple derivative-free optimizers:
 
 Key Definitions
 ---------------
-Let C0 be the “CURN” covariance (noise + auto terms of the HD), and C be the
-full H1 covariance (noise + full HD). We work with Cholesky-like factors L0, L1
-such that C0 = L0 L0^T and C = L1 L1^T. For any candidate D (normalized in the
-N-inner product with N=C0), we scale it to D* = s D so that
-  FAP = 1 - CDF_H0(τ; D*) = fap_target,
+Let N be the covariance under H_N (“CURN”: noise + auto terms of the HD), and
+S the covariance under H_S (noise + full HD). We work with Cholesky-like
+factors LN, LS such that N = LN LN^T and S = LS LS^T. For any candidate Q
+(normalized in the N-inner product), we scale it to Q* = s Q so that
+  FAP = 1 - F(τ, N, Q*) = fap_target,
 then compute
-  DP  = 1 - CDF_H1(τ; D*).
+  DP  = 1 - F(τ, S, Q*).
+
+The canonical filters used for comparison and as starting points are
+  • NP   – Neyman–Pearson filter, Q_NP = N^{-1} - S^{-1} (uses autocorrelations),
+  • NPMV – Neyman–Pearson-Minimum-Variance filter: the zero-diagonal filter
+           whose statistic is closest (minimum variance under H_N) to NP. For
+           the block-diagonal N used here, this is Q_NP with its diagonal
+           set to zero,
+  • DF   – deflection filter, Q_DF = N^{-1} (S - N) N^{-1} (`QDEF` in the
+           code). For the CURN null used here it has zero diagonal, so it
+           equals DFCC, the literature-standard “optimal” cross-correlation
+           statistic.
 
 Usage Examples
 --------------
@@ -72,14 +92,15 @@ python optimize-filter.py --mode full-incremental --npsrs 67 --inc_start 10 \
 
 Notes & Conventions
 -------------------
-• Normalization: most builders return filters normalized in the N-inner product
-  (N = C0), i.e., D / sqrt(tr(D N D N)). FULL mode internally normalizes a
+• Normalization: most builders return filters normalized in the N-inner product,
+  i.e., Q / sqrt(tr(Q N Q N)). FULL mode internally normalizes a
   candidate matrix built from its parameter vector x before scaling to FAP.
-• Complex-valued toy model: when using Imhof’s method to evaluate distributions
-  of indefinite quadratic forms, eigenvalues are duplicated (repeat(2)).
+• Complex-valued toy model: Imhof evaluates the real quadratic form equivalent
+  to z ~ CN(0, C), with C = N or S. Each eigenvalue λ of L^T Q L (C = L L^T)
+  is used twice, with weight λ/2.
 • Output: each successful run writes
-     D_star.npy       – scaled filter achieving the requested FAP at τ
-     D_unscaled.npy   – normalized filter before scaling
+     Q_star.npy       – scaled filter achieving the requested FAP at τ
+     Q_unscaled.npy   – normalized filter before scaling
      result.json      – metadata (DP, scale factor, options)
      x_opt.json       – (FULL modes) vector of optimized lower-triangular entries
 
@@ -184,7 +205,7 @@ psrs_pos_15yr = np.array([
     [ 0.92132969, -0.15264057,  0.35756462]
 ])
 
-# ===================== HD kernel & utilities =====================
+# ===================== HD matrix & utilities =====================
 
 def phitheta_to_psrpos(phi: np.ndarray, theta: np.ndarray) -> np.ndarray:
     """Convert spherical coordinates to 3D unit vectors on S².
@@ -260,22 +281,22 @@ def hdcorrmat(psrpos: np.ndarray, psrTerm: bool = True) -> np.ndarray:
 # ===================== Covariances & canonical filters =====================
 
 def get_cov_matrices(h: float, hdmat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Construct C0 (CURN) and C (noise + signal) for a given HD matrix.
+    """Construct N (CURN null hypothesis H_N) and S (signal hypothesis H_S) for a given HD matrix.
 
     Args:
         h: Signal amplitude scale (we typically use h=1 here).
         hdmat: (N,N) HD correlation matrix.
 
     Returns:
-        Tuple (C0, C) where
-          - C0 = I + diag(diag(h^2 * HD))   (noise + auto terms)
-          - C  = I + h^2 * HD               (full H1 covariance).
+        Tuple (N, S) where
+          - N = I + diag(diag(h^2 * HD))   (H_N: noise + auto terms)
+          - S = I + h^2 * HD               (H_S: noise + full HD).
     """
     C_noise = np.identity(len(hdmat))
     C_signal = (h**2) * hdmat
     N = C_noise + np.diag(np.diag(C_signal))  # CURN
-    C = C_noise + C_signal
-    return N, C
+    S = C_noise + C_signal
+    return N, S
 
 
 def norm_filter(Q: np.ndarray, N: np.ndarray) -> np.ndarray:
@@ -283,7 +304,7 @@ def norm_filter(Q: np.ndarray, N: np.ndarray) -> np.ndarray:
 
     Args:
         Q: (N,N) symmetric, zero-diagonal filter matrix.
-        N: (N,N) inner-product metric (usually C0).
+        N: (N,N) inner-product metric (the H_N covariance).
 
     Returns:
         Q / sqrt(tr(Q N Q N)).
@@ -305,41 +326,45 @@ def norm_filter_white(Q: np.ndarray) -> np.ndarray:
 
 
 def get_all_filters(h: float, hdmat: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Construct canonical NP/Off-diag-NP (NPMV)/DF filters and Cholesky factors.
+    """Construct canonical NP/NPMV/DF filters and Cholesky factors.
 
     Args:
         h: Signal amplitude (usually 1.0 here).
         hdmat: (N,N) HD correlation matrix.
 
     Returns:
-        (DNP, DNPW, DDEF, L0, L1):
-          - DNP:  Neyman–Pearson filter normalized in N=C0
-          - DNPW: Off-diagonal-only version of DNP (NPMV), normalized in N
-          - DDEF: Difference filter (C - C0) in N, normalized
-          - L0:   such that C0 = L0 L0^T
-          - L1:   such that C  = L1 L1^T.
+        (QNP, QNPMV, QDEF, LN, LS), all filters normalized in the N-inner product:
+          - QNP:   Neyman–Pearson filter N^{-1} - S^{-1}
+          - QNPMV: NPMV filter; for the diagonal N used here this is QNP
+                   with its diagonal set to zero
+          - QDEF:  Deflection filter N^{-1} (S - N) N^{-1} (DF; equal to DFCC
+                   for the CURN null used here)
+          - LN:    such that N = LN LN^T
+          - LS:    such that S = LS LS^T.
     """
-    C0, CS = get_cov_matrices(h, hdmat=hdmat)
-    L0 = np.diag(np.sqrt(np.diag(C0)))  # whitening factor for H0
-    L1 = sl.cholesky(CS, lower=True)
-    C0_inv = np.diag(1/np.diag(C0))
+    N, S = get_cov_matrices(h, hdmat=hdmat)
+    LN = np.diag(np.sqrt(np.diag(N)))  # whitening factor for H_N
+    LS = sl.cholesky(S, lower=True)
+    N_inv = np.diag(1/np.diag(N))
 
-    DNP = C0_inv - sl.cho_solve((L1, True), np.identity(len(CS)))
-    DNPW = DNP.copy(); np.fill_diagonal(DNPW, 0)
-    DDEF = C0_inv @ (CS - C0) @ C0_inv
+    QNP = N_inv - sl.cho_solve((LS, True), np.identity(len(S)))
+    QNPMV = QNP.copy(); np.fill_diagonal(QNPMV, 0)
+    QDEF = N_inv @ (S - N) @ N_inv
 
-    DNPW = norm_filter(DNPW, C0)
-    DNP  = norm_filter(DNP , C0)
-    DDEF = norm_filter(DDEF, C0)
-    return DNP, DNPW, DDEF, L0, L1
+    QNPMV = norm_filter(QNPMV, N)
+    QNP  = norm_filter(QNP , N)
+    QDEF = norm_filter(QDEF, N)
+    return QNP, QNPMV, QDEF, LN, LS
 
 # ===================== GX^2 CDFs =====================
 
 def _logsumexp_signed(log_pos_list: List[float], log_neg_list: List[float]) -> float:
     """Stable evaluation of Σ exp(lp) − Σ exp(ln) in log-domain.
 
-    This helper avoids catastrophic cancellation when forming an analytic
-    series for the CDF of indefinite quadratic forms.
+    This helper sums the positive and negative terms of the analytic CDF of
+    an indefinite quadratic form separately in the log domain (avoiding
+    overflow), then takes their difference in double precision. See
+    compute_cdf.py for an arbitrary-precision evaluation of the same sum.
 
     Args:
         log_pos_list: Log-terms contributing with + sign.
@@ -364,10 +389,10 @@ def _logsumexp_signed(log_pos_list: List[float], log_neg_list: List[float]) -> f
 
 
 def gx2cdf_an_from_eigs(evals: np.ndarray, tau: float) -> float:
-    """Analytic CDF F(tau; Q) for a central, complex-valued indefinite quadratic form.
+    """Analytic CDF F(tau, C, Q) for a central, complex-valued indefinite quadratic form.
 
     Args:
-        evals: Eigenvalues of L^T Q L (not duplicated).
+        evals: Eigenvalues λ of L^T Q L, with C = L L^T (same as those of C^{1/2} Q C^{1/2}).
         tau: Threshold τ for the quadratic statistic.
 
     Returns:
@@ -398,7 +423,7 @@ def gx2cdf_an_from_eigs(evals: np.ndarray, tau: float) -> float:
         sgns = np.sign(den)
         absden = np.abs(den) + tiny
         sgn_j = np.prod(sgns)
-        log_term = (-0.5 * t / lj) - np.sum(np.log(absden))
+        log_term = (-t / lj) - np.sum(np.log(absden))
         if sgn_j >= 0:
             log_pos_terms.append(log_term)
         else:
@@ -418,7 +443,7 @@ def _imhof_integrand(u: float, x: float, eigs: np.ndarray, part: str = "cdf") ->
     Args:
         u: Integration variable.
         x: Threshold τ.
-        eigs: Eigenvalues (duplicated for complex case externally).
+        eigs: Weights of the real quadratic form (for complex data: λ/2, each twice).
         part: "cdf" (sin term / (u*rho)) or "pdf-like" ("cos"/rho), for completeness.
 
     Returns:
@@ -442,7 +467,7 @@ def gx2cdf_imhof_from_eigs(evals: np.ndarray, tau: float,
     """CDF via Imhof’s method for a central, indefinite quadratic form.
 
     Args:
-        evals: Eigenvalues of L^T Q L (not duplicated). Complex case handled by duplication here.
+        evals: Eigenvalues λ of L^T Q L. Each λ is passed to Imhof as weight λ/2, twice.
         tau: Threshold τ.
         cutoff: Drop |λ| ≤ cutoff for numerical stability (0 keeps all).
         limit: SciPy quad `limit` (subinterval cap).
@@ -452,9 +477,10 @@ def gx2cdf_imhof_from_eigs(evals: np.ndarray, tau: float,
         CDF value in [0,1].
     """
     w = np.asarray(evals, dtype=float)
-    ww = np.repeat(w, 2)  # complex-valued duplication
     if cutoff > 0:
-        ww = ww[np.abs(ww) > cutoff]
+        w = w[np.abs(w) > cutoff]
+    # z ~ CN(0, C): real GX2 weights are λ/2, each with multiplicity 2.
+    ww = np.repeat(w, 2) * 0.5
     if ww.size == 0:
         return 1.0 if float(tau) >= 0.0 else 0.0
 
@@ -468,7 +494,7 @@ def gx2cdf_from_eigs(evals: np.ndarray, tau: float, method: str = "analytic") ->
     """Compute CDF for a central indefinite quadratic form with chosen backend.
 
     Args:
-        evals: Eigenvalues of L^T Q L (not duplicated).
+        evals: Eigenvalues λ of L^T Q L, with C = L L^T.
         tau: Threshold τ.
         method: "analytic" or "imhof".
 
@@ -486,11 +512,11 @@ def gx2cdf_from_eigs(evals: np.ndarray, tau: float, method: str = "analytic") ->
 
 def scale_to_fap(L: np.ndarray, Q: np.ndarray, tau: float, fap_target: float,
                  max_doubles: int = 60, cdf_method: str = "analytic") -> Optional[float]:
-    """Find s>0 such that FAP_H0(s Q; τ) = fap_target.
+    """Find s>0 such that the FAP under H_N, 1 - F(τ, N, s Q), equals fap_target.
 
     Args:
-        L: Factor so that C0 = L L^T under H0.
-        Q: Normalized decision matrix (N-inner product).
+        L: Factor so that N = L L^T under H_N.
+        Q: Normalized filter (N-inner product).
         tau: Threshold τ (>0).
         fap_target: Desired false-alarm probability in (0,1).
         max_doubles: Max doublings while bracketing the root.
@@ -504,17 +530,17 @@ def scale_to_fap(L: np.ndarray, Q: np.ndarray, tau: float, fap_target: float,
     if tau <= 0:
         return None
     try:
-        w0 = sl.eigvalsh(L.T @ Q @ L)
+        evals_N = sl.eigvalsh(L.T @ Q @ L)
     except Exception:
         return None
 
     def fap_of_s(s: float) -> float:
         if not np.isfinite(s) or s <= 0:
             return np.nan
-        cdf0 = gx2cdf_from_eigs(s * w0, tau, method=cdf_method)
-        if not np.isfinite(cdf0):
+        cdf_N = gx2cdf_from_eigs(s * evals_N, tau, method=cdf_method)
+        if not np.isfinite(cdf_N):
             return np.nan
-        return 1.0 - cdf0
+        return 1.0 - cdf_N
 
     s_lo = 1e-8; f_lo = fap_of_s(s_lo); nstep = 0
     while (not np.isfinite(f_lo) or f_lo >= fap_target) and nstep < 20:
@@ -534,14 +560,14 @@ def scale_to_fap(L: np.ndarray, Q: np.ndarray, tau: float, fap_target: float,
     return float(s) if np.isfinite(s) and s > 0 else None
 
 
-def scale_decision_matrix(L: np.ndarray, Q: np.ndarray, tau: float, faprob: float = 0.1,
+def scale_filter_matrix(L: np.ndarray, Q: np.ndarray, tau: float, faprob: float = 0.1,
                           cdf_method: str = "analytic") -> Optional[np.ndarray]:
     """Return s*Q scaled to the requested FAP at τ, if solvable.
 
     Args:
-        L: Factor so that C0 = L L^T under H0.
-        Q: Normalized decision matrix.
-        tau: Decision threshold τ (>0).
+        L: Factor so that N = L L^T under H_N.
+        Q: Normalized filter.
+        tau: Threshold τ (>0).
         faprob: Target false-alarm probability.
         cdf_method: CDF backend ("analytic" or "imhof").
 
@@ -557,7 +583,7 @@ def scale_decision_matrix(L: np.ndarray, Q: np.ndarray, tau: float, faprob: floa
 
 # --- Full (free off-diagonal) ---
 
-def construct_decision_matrix(x: np.ndarray, normalize: bool = False) -> np.ndarray:
+def construct_filter_matrix(x: np.ndarray, normalize: bool = False) -> np.ndarray:
     """Map a vector of strict lower-triangular entries to a symmetric zero-diagonal matrix.
 
     Args:
@@ -571,73 +597,73 @@ def construct_decision_matrix(x: np.ndarray, normalize: bool = False) -> np.ndar
     m = len(elements)
     n = int(0.5 * (np.sqrt(8*m + 1) + 1))
     i, j = np.tril_indices(n, k=-1)
-    D = np.zeros((n, n))
-    D[i, j] = elements
-    D = D + D.T
-    np.fill_diagonal(D, 0.0)
-    return D
+    Q = np.zeros((n, n))
+    Q[i, j] = elements
+    Q = Q + Q.T
+    np.fill_diagonal(Q, 0.0)
+    return Q
 
 
-def get_lower_triangular_elements(D: np.ndarray) -> np.ndarray:
+def get_lower_triangular_elements(Q: np.ndarray) -> np.ndarray:
     """Vectorize the strict lower-triangular part of a square matrix.
 
     Args:
-        D: (n,n) matrix.
+        Q: (n,n) matrix.
 
     Returns:
         Vector of length m = n(n−1)/2 with entries of the strict lower triangle.
     """
-    i, j = np.tril_indices(D.shape[0], k=-1)
-    return D[i, j]
+    i, j = np.tril_indices(Q.shape[0], k=-1)
+    return Q[i, j]
 
 
-def det_prob(x: np.ndarray, L0: np.ndarray, LS: np.ndarray, faprob: float = 0.1,
+def det_prob(x: np.ndarray, LN: np.ndarray, LS: np.ndarray, faprob: float = 0.1,
              normalized_coords: bool = False, tau: float = 1.0,
              cdf_method: str = "analytic") -> float:
     """Objective: detection probability for FULL parameterization.
 
     Args:
-        x: Vectorized strict lower-triangular parameters of D.
-        L0: Factor for H0 (C0 = L0 L0^T).
-        LS: Factor for H1 (C  = LS LS^T).
+        x: Vectorized strict lower-triangular parameters of Q.
+        LN: Factor for H_N (N = LN LN^T).
+        LS: Factor for H_S (S = LS LS^T).
         faprob: Target false-alarm probability.
         normalized_coords: Unused here; kept for API consistency.
         tau: Threshold τ (>0).
         cdf_method: "analytic" or "imhof".
 
     Returns:
-        DP in [0,1]. Returns −inf (as a float) if invalid/failed.
+        Detection probability (DP) in [0,1]. Returns −inf (as a float) if invalid/failed.
     """
     if tau <= 0 or not np.isfinite(tau):
         return -np.inf
-    D = construct_decision_matrix(x, normalize=normalized_coords)
-    N = L0 @ L0.T
-    nrm2 = np.trace(D @ N @ D @ N)
+    Q = construct_filter_matrix(x, normalize=normalized_coords)
+    N = LN @ LN.T
+    nrm2 = np.trace(Q @ N @ Q @ N)
     if not np.isfinite(nrm2) or nrm2 <= 0:
         return -np.inf
-    D = D / np.sqrt(nrm2)
-    D_scaled = scale_decision_matrix(L0, D, tau=tau, faprob=faprob, cdf_method=cdf_method)
-    if D_scaled is None:
+    Q = Q / np.sqrt(nrm2)
+    Q_scaled = scale_filter_matrix(LN, Q, tau=tau, faprob=faprob, cdf_method=cdf_method)
+    if Q_scaled is None:
         return -np.inf
     try:
-        w1 = sl.eigvalsh(LS.T @ D_scaled @ LS)
+        evals_S = sl.eigvalsh(LS.T @ Q_scaled @ LS)
     except Exception:
         return -np.inf
-    cdf1 = gx2cdf_from_eigs(w1, tau, method=cdf_method)
-    if not np.isfinite(cdf1):
+    cdf_S = gx2cdf_from_eigs(evals_S, tau, method=cdf_method)
+    if not np.isfinite(cdf_S):
         return -np.inf
-    DP = 1.0 - float(cdf1)
+    DP = 1.0 - float(cdf_S)
     return float(min(1.0, max(0.0, DP)))
 
 
-def dp_from_normalized_matrix(D: np.ndarray, L0: np.ndarray, L1: np.ndarray,
+def dp_from_normalized_matrix(Q: np.ndarray, LN: np.ndarray, LS: np.ndarray,
                               faprob: float, tau: float, cdf_method: str) -> float:
-    """Detection probability for a normalized decision matrix D (N-inner product).
+    """Detection probability for a normalized filter Q (N-inner product).
 
     Args:
-        D: Normalized decision matrix (under N=C0).
-        L0: Factor so C0 = L0 L0^T.
-        L1: Factor so C  = L1 L1^T.
+        Q: Normalized filter (N-inner product).
+        LN: Factor so N = LN LN^T.
+        LS: Factor so S = LS LS^T.
         faprob: Target false-alarm probability.
         tau: Threshold τ (>0).
         cdf_method: "analytic" or "imhof".
@@ -645,17 +671,17 @@ def dp_from_normalized_matrix(D: np.ndarray, L0: np.ndarray, L1: np.ndarray,
     Returns:
         DP value in [0,1], or −inf-like on failure.
     """
-    s = scale_to_fap(L0, D, tau, faprob, cdf_method=cdf_method)
+    s = scale_to_fap(LN, Q, tau, faprob, cdf_method=cdf_method)
     if s is None or not np.isfinite(s):
         return -np.inf
     try:
-        w1 = sl.eigvalsh(L1.T @ (s*D) @ L1)
+        evals_S = sl.eigvalsh(LS.T @ (s*Q) @ LS)
     except Exception:
         return -np.inf
-    cdf1 = gx2cdf_from_eigs(w1, tau, method=cdf_method)
-    if not np.isfinite(cdf1):
+    cdf_S = gx2cdf_from_eigs(evals_S, tau, method=cdf_method)
+    if not np.isfinite(cdf_S):
         return -np.inf
-    return float(min(1.0, max(0.0, 1.0 - cdf1)))
+    return float(min(1.0, max(0.0, 1.0 - cdf_S)))
 
 # --- Legendre (zonal matrix basis) ---
 
@@ -682,7 +708,7 @@ def gram_matrix(B: Sequence[np.ndarray], N: np.ndarray) -> np.ndarray:
 
     Args:
         B: Sequence of basis matrices.
-        N: Inner-product metric (C0).
+        N: Inner-product metric (the H_N covariance).
 
     Returns:
         (L,L) Gram matrix.
@@ -696,48 +722,48 @@ def gram_matrix(B: Sequence[np.ndarray], N: np.ndarray) -> np.ndarray:
     return G
 
 
-def D_from_alpha(alpha: np.ndarray, B: Sequence[np.ndarray], G: np.ndarray, N: np.ndarray
+def Q_from_alpha(alpha: np.ndarray, B: Sequence[np.ndarray], G: np.ndarray, N: np.ndarray
                  ) -> Optional[np.ndarray]:
-    """Form a normalized D = Σ α_i B_i under the N-inner product.
+    """Form a normalized Q = Σ α_i B_i under the N-inner product.
 
     Args:
         alpha: Coefficients for the basis (length = len(B)).
         B: Basis matrices.
         G: Gram matrix under N-inner product.
-        N: Inner-product matrix (C0).
+        N: Inner-product matrix (the H_N covariance).
 
     Returns:
-        Normalized D with zero diagonal, or None if normalization fails.
+        Normalized Q with zero diagonal, or None if normalization fails.
     """
     q = float(alpha @ G @ alpha)
     if not np.isfinite(q) or q <= 0:
         return None
     a = alpha / np.sqrt(q)
-    D = np.zeros_like(B[0])
+    Q = np.zeros_like(B[0])
     for ai, Bi in zip(a, B):
-        D += ai * Bi
-    np.fill_diagonal(D, 0.0)
-    nrm2 = np.trace(D @ N @ D @ N)
+        Q += ai * Bi
+    np.fill_diagonal(Q, 0.0)
+    nrm2 = np.trace(Q @ N @ Q @ N)
     if not np.isfinite(nrm2) or nrm2 <= 0:
         return None
-    D /= np.sqrt(nrm2)
-    return D
+    Q /= np.sqrt(nrm2)
+    return Q
 
 
-def project_D_to_alpha(D: np.ndarray, B: Sequence[np.ndarray], G: np.ndarray, N: np.ndarray
+def project_Q_to_alpha(Q: np.ndarray, B: Sequence[np.ndarray], G: np.ndarray, N: np.ndarray
                        ) -> np.ndarray:
-    """Project a matrix D onto span{B_i} via least squares under the N-inner product.
+    """Project a matrix Q onto span{B_i} via least squares under the N-inner product.
 
     Args:
-        D: Matrix to project.
+        Q: Matrix to project.
         B: Basis matrices.
         G: Gram matrix under N-inner product.
-        N: Inner-product matrix (C0).
+        N: Inner-product matrix (the H_N covariance).
 
     Returns:
-        Coefficient vector alpha minimizing ||D - Σ α_i B_i||_N.
+        Coefficient vector alpha minimizing ||Q - Σ α_i B_i||_N.
     """
-    b = np.array([np.trace((Bi @ N) @ (D @ N)) for Bi in B], dtype=float)
+    b = np.array([np.trace((Bi @ N) @ (Q @ N)) for Bi in B], dtype=float)
     try:
         alpha = sl.solve(G + 1e-12*np.eye(len(G)), b, assume_a='pos')
     except Exception:
@@ -745,18 +771,18 @@ def project_D_to_alpha(D: np.ndarray, B: Sequence[np.ndarray], G: np.ndarray, N:
     return alpha
 
 
-def det_prob_alpha(alpha: np.ndarray, L0: np.ndarray, L1: np.ndarray, B: Sequence[np.ndarray],
+def det_prob_alpha(alpha: np.ndarray, LN: np.ndarray, LS: np.ndarray, B: Sequence[np.ndarray],
                    G: np.ndarray, N: np.ndarray, faprob: float = 0.1, tau: float = 1.0,
                    cdf_method: str = "analytic") -> float:
     """Detection probability for a zonal (Legendre) parameterization.
 
     Args:
         alpha: Coefficients in the Legendre basis.
-        L0: Factor for H0 (C0 = L0 L0^T).
-        L1: Factor for H1 (C  = L1 L1^T).
+        LN: Factor for H_N (N = LN LN^T).
+        LS: Factor for H_S (S = LS LS^T).
         B: Legendre basis matrices with zero diagonal.
         G: Gram matrix under N-inner product.
-        N: Inner-product matrix (C0).
+        N: Inner-product matrix (the H_N covariance).
         faprob: Target FAP.
         tau: Threshold τ (>0).
         cdf_method: "analytic" or "imhof".
@@ -766,20 +792,20 @@ def det_prob_alpha(alpha: np.ndarray, L0: np.ndarray, L1: np.ndarray, B: Sequenc
     """
     if tau <= 0 or not np.isfinite(tau):
         return -np.inf
-    D = D_from_alpha(alpha, B, G, N)
-    if D is None:
+    Q = Q_from_alpha(alpha, B, G, N)
+    if Q is None:
         return -np.inf
-    s = scale_to_fap(L0, D, tau, faprob, cdf_method=cdf_method)
+    s = scale_to_fap(LN, Q, tau, faprob, cdf_method=cdf_method)
     if s is None or not np.isfinite(s):
         return -np.inf
     try:
-        w1 = sl.eigvalsh(L1.T @ (s*D) @ L1)
+        evals_S = sl.eigvalsh(LS.T @ (s*Q) @ LS)
     except Exception:
         return -np.inf
-    cdf1 = gx2cdf_from_eigs(w1, tau, method=cdf_method)
-    if not np.isfinite(cdf1):
+    cdf_S = gx2cdf_from_eigs(evals_S, tau, method=cdf_method)
+    if not np.isfinite(cdf_S):
         return -np.inf
-    DP = 1.0 - float(cdf1)
+    DP = 1.0 - float(cdf_S)
     return float(min(1.0, max(0.0, DP)))
 
 # ===================== Safe JSON save =====================
@@ -824,25 +850,25 @@ def nullspace_w(w: np.ndarray) -> np.ndarray:
     return Vt[1:, :].T  # shape L×(L-1)
 
 
-def build_lowrank_basis_from_residual(D_target: np.ndarray, B: Sequence[np.ndarray], G: np.ndarray,
+def build_lowrank_basis_from_residual(Q_target: np.ndarray, B: Sequence[np.ndarray], G: np.ndarray,
                                       N: np.ndarray, r: int) -> List[np.ndarray]:
     """Construct r low-rank symmetric directions from residual (NP − zonal fit).
 
     Args:
-        D_target: Target matrix to approximate (e.g., NP).
+        Q_target: Target matrix to approximate (e.g., NP).
         B: Zonal basis list.
         G: Gram matrix under N-inner product.
-        N: Inner-product matrix (C0).
+        N: Inner-product matrix (the H_N covariance).
         r: Number of low-rank directions to add.
 
     Returns:
         List of r (N,N) symmetric, zero-diagonal low-rank basis matrices.
     """
-    alpha_fit = project_D_to_alpha(D_target, B, G, N)
-    Dz = D_from_alpha(alpha_fit, B, G, N)
-    if Dz is None:
-        Dz = np.zeros_like(D_target)
-    R = D_target - Dz
+    alpha_fit = project_Q_to_alpha(Q_target, B, G, N)
+    Qz = Q_from_alpha(alpha_fit, B, G, N)
+    if Qz is None:
+        Qz = np.zeros_like(Q_target)
+    R = Q_target - Qz
     R = (R + R.T) / 2.0
     np.fill_diagonal(R, 0.0)
     try:
@@ -878,21 +904,21 @@ def optimize_with_legendre(psrpos: np.ndarray, faprob: float, tau: float, Lmax: 
         start_from_npmv: If True, project NPMV to initialize first start; else DF.
 
     Returns:
-        (D_star, meta) where D_star is scaled to requested FAP at τ
+        (Q_star, meta) where Q_star is scaled to requested FAP at τ
         and meta contains DP, scale, and configuration details.
     """
     cosgamma = np.clip(psrpos @ psrpos.T, -1.0, 1.0)
     np.fill_diagonal(cosgamma, 1.0)
     hdmat = hdcorrmat(psrpos, psrTerm=True)
     h_opt = 1.0
-    DNP, DNPW, DDEF, L_H0, L_H1 = get_all_filters(h_opt, hdmat)
-    N = L_H0 @ L_H0.T
+    QNP, QNPMV, QDEF, L_HN, L_HS = get_all_filters(h_opt, hdmat)
+    N = L_HN @ L_HN.T
     B = build_legendre_basis(cosgamma, Lmax)
     G = gram_matrix(B, N)
 
     rng = np.random.default_rng(seed)
-    init_D = DNPW if start_from_npmv else DDEF
-    alpha0 = project_D_to_alpha(init_D, B, G, N)
+    init_Q = QNPMV if start_from_npmv else QDEF
+    alpha0 = project_Q_to_alpha(init_Q, B, G, N)
 
     best = {"DP": -np.inf, "alpha": None, "scale": None}
     for k in range(n_starts):
@@ -909,18 +935,18 @@ def optimize_with_legendre(psrpos: np.ndarray, faprob: float, tau: float, Lmax: 
         opt.set_maxeval(2000)
 
         def obj(a: np.ndarray, grad: np.ndarray) -> float:
-            DP = det_prob_alpha(a, L_H0, L_H1, B, G, N,
+            DP = det_prob_alpha(a, L_HN, L_HS, B, G, N,
                                 faprob=faprob, tau=tau, cdf_method=cdf_method)
             return -float(DP if np.isfinite(DP) else -np.inf)
 
         opt.set_min_objective(obj)
         try:
             a_opt = opt.optimize(x0)
-            DP = det_prob_alpha(a_opt, L_H0, L_H1, B, G, N,
+            DP = det_prob_alpha(a_opt, L_HN, L_HS, B, G, N,
                                 faprob=faprob, tau=tau, cdf_method=cdf_method)
             if DP > best["DP"]:
-                D_opt = D_from_alpha(a_opt, B, G, N)
-                s_opt = scale_to_fap(L_H0, D_opt, tau, faprob, cdf_method=cdf_method)
+                Q_opt = Q_from_alpha(a_opt, B, G, N)
+                s_opt = scale_to_fap(L_HN, Q_opt, tau, faprob, cdf_method=cdf_method)
                 best.update(DP=float(DP), alpha=a_opt.tolist(), scale=float(s_opt))
         except nlopt.RoundoffLimited:
             continue
@@ -930,14 +956,14 @@ def optimize_with_legendre(psrpos: np.ndarray, faprob: float, tau: float, Lmax: 
     if best["alpha"] is None:
         raise RuntimeError("No successful optimization. Try increasing starts/Lmax.")
 
-    alpha_best = np.array(best["alpha"])  # unscaled normalized D
-    D_unscaled = D_from_alpha(alpha_best, B, G, N)
+    alpha_best = np.array(best["alpha"])  # unscaled normalized Q
+    Q_unscaled = Q_from_alpha(alpha_best, B, G, N)
     s_best = float(best["scale"])
-    D_star = s_best * D_unscaled
+    Q_star = s_best * Q_unscaled
 
     os.makedirs(outdir, exist_ok=True)
-    np.save(os.path.join(outdir, "D_star.npy"), D_star)
-    np.save(os.path.join(outdir, "D_unscaled.npy"), D_unscaled)
+    np.save(os.path.join(outdir, "Q_star.npy"), Q_star)
+    np.save(os.path.join(outdir, "Q_unscaled.npy"), Q_unscaled)
     atomic_save_json(os.path.join(outdir, "result.json"),
         {
             "mode": "legendre",
@@ -953,16 +979,16 @@ def optimize_with_legendre(psrpos: np.ndarray, faprob: float, tau: float, Lmax: 
             "start_from_npmv": bool(start_from_npmv),
         }
     )
-    return D_star, best
+    return Q_star, best
 
 # ========= FULL helpers: objective wrapper, finalize, polish, subspace ==========
 
-def _dp_obj_factory(L_H0, L_H1, faprob, tau, cdf_method):
+def _dp_obj_factory(L_HN, L_HS, faprob, tau, cdf_method):
     """Build a closure evaluating DP for FULL parameterization (used by optimizers).
 
     Args:
-        L_H0: Factor for H0 (C0 = L_H0 L_H0^T).
-        L_H1: Factor for H1 (C  = L_H1 L_H1^T).
+        L_HN: Factor for H_N (N = L_HN L_HN^T).
+        L_HS: Factor for H_S (S = L_HS L_HS^T).
         faprob: Target FAP.
         tau: Threshold τ (>0).
         cdf_method: "analytic" or "imhof".
@@ -971,22 +997,22 @@ def _dp_obj_factory(L_H0, L_H1, faprob, tau, cdf_method):
         Callable: f(x) → DP(x) as a float (−inf on failure).
     """
     def eval_dp(x: np.ndarray) -> float:
-        DP = det_prob(x, L_H0, L_H1, faprob=faprob, normalized_coords=False,
+        DP = det_prob(x, L_HN, L_HS, faprob=faprob, normalized_coords=False,
                       tau=tau, cdf_method=cdf_method)
         return float(DP if np.isfinite(DP) else -np.inf)
     return eval_dp
 
-def _finalize_and_save_full(x_best: np.ndarray, L_H0, L_H1, N, faprob, tau, cdf_method,
+def _finalize_and_save_full(x_best: np.ndarray, L_HN, L_HS, N, faprob, tau, cdf_method,
                             outdir: str, seed: int, m: int, maxeval: int, bound: float,
                             start_json: Optional[str], start_from_npmv: bool, resume: bool,
                             optimizer_name: str, extra_meta: dict) -> Tuple[np.ndarray, dict]:
     """Finalize a FULL optimization: normalize, scale to FAP, save artifacts.
 
     Args:
-        x_best: Optimized lower-triangular vector of D.
-        L_H0: Factor for H0 (C0 = L_H0 L_H0^T).
-        L_H1: Factor for H1 (C  = L_H1 L_H1^T).
-        N: Inner-product matrix (C0).
+        x_best: Optimized lower-triangular vector of Q.
+        L_HN: Factor for H_N (N = L_HN L_HN^T).
+        L_HS: Factor for H_S (S = L_HS L_HS^T).
+        N: Inner-product matrix (the H_N covariance).
         faprob: Target FAP.
         tau: Threshold τ (>0).
         cdf_method: "analytic" or "imhof".
@@ -1002,24 +1028,24 @@ def _finalize_and_save_full(x_best: np.ndarray, L_H0, L_H1, N, faprob, tau, cdf_
         extra_meta: Additional metadata to include in result.json.
 
     Returns:
-        (D_star, meta) where D_star is scaled to requested FAP; meta includes DP and scale.
+        (Q_star, meta) where Q_star is scaled to requested FAP; meta includes DP and scale.
     """
-    D = construct_decision_matrix(x_best, normalize=False)
-    nrm2 = np.trace(D @ N @ D @ N)
+    Q = construct_filter_matrix(x_best, normalize=False)
+    nrm2 = np.trace(Q @ N @ Q @ N)
     if not np.isfinite(nrm2) or nrm2 <= 0:
-        raise RuntimeError("Final D normalization failed.")
-    D /= np.sqrt(nrm2)
-    s_opt = scale_to_fap(L_H0, D, tau, faprob, cdf_method=cdf_method)
+        raise RuntimeError("Final Q normalization failed.")
+    Q /= np.sqrt(nrm2)
+    s_opt = scale_to_fap(L_HN, Q, tau, faprob, cdf_method=cdf_method)
     if s_opt is None:
         raise RuntimeError("Final scaling to FAP failed.")
-    D_unscaled = D.copy()
-    D_star = s_opt * D_unscaled
-    DP = det_prob(x_best, L_H0, L_H1, faprob=faprob, normalized_coords=False,
+    Q_unscaled = Q.copy()
+    Q_star = s_opt * Q_unscaled
+    DP = det_prob(x_best, L_HN, L_HS, faprob=faprob, normalized_coords=False,
                   tau=tau, cdf_method=cdf_method)
 
     os.makedirs(outdir, exist_ok=True)
-    np.save(os.path.join(outdir, "D_star.npy"), D_star)
-    np.save(os.path.join(outdir, "D_unscaled.npy"), D_unscaled)
+    np.save(os.path.join(outdir, "Q_star.npy"), Q_star)
+    np.save(os.path.join(outdir, "Q_unscaled.npy"), Q_unscaled)
     atomic_save_json(os.path.join(outdir, "result.json"),
         dict({
             "mode": "full",
@@ -1040,7 +1066,7 @@ def _finalize_and_save_full(x_best: np.ndarray, L_H0, L_H1, N, faprob, tau, cdf_
         }, **extra_meta)
     )
     atomic_save_json(os.path.join(outdir, "x_opt.json"), x_best.tolist())
-    return D_star, {"DP": float(DP), "scale": float(s_opt)}
+    return Q_star, {"DP": float(DP), "scale": float(s_opt)}
 
 def _polish_bobyqa(x0: np.ndarray, eval_dp, bound: float, eval_budget: int) -> np.ndarray:
     """Run a short full-dimensional BOBYQA polish around x0.
@@ -1143,13 +1169,13 @@ def optimize_zonal_alpha_aware(psrpos: np.ndarray, faprob: float, tau: float, Lm
         start_from_npmv: Initialize from NPMV (recommended for cross-only).
 
     Returns:
-        (D_star, meta) as usual (scaled to FAP, with DP, scale).
+        (Q_star, meta) as usual (scaled to FAP, with DP, scale).
     """
     cosgamma = np.clip(psrpos @ psrpos.T, -1.0, 1.0)
     np.fill_diagonal(cosgamma, 1.0)
     hdmat = hdcorrmat(psrpos, psrTerm=True)
-    DNP, DNPW, DDEF, L_H0, L_H1 = get_all_filters(1.0, hdmat)
-    N = L_H0 @ L_H0.T
+    QNP, QNPMV, QDEF, L_HN, L_HS = get_all_filters(1.0, hdmat)
+    N = L_HN @ L_HN.T
 
     B = build_legendre_basis(cosgamma, Lmax)
     G = gram_matrix(B, N)
@@ -1157,8 +1183,8 @@ def optimize_zonal_alpha_aware(psrpos: np.ndarray, faprob: float, tau: float, Lm
     w = zonal_weights(Lmax)
     U = nullspace_w(w)  # L × (L-1)
 
-    init_D = DNPW if start_from_npmv else DNP  # cross-only-friendly init
-    alpha_init = project_D_to_alpha(init_D, B, G, N)
+    init_Q = QNPMV if start_from_npmv else QNP  # cross-only-friendly init
+    alpha_init = project_Q_to_alpha(init_Q, B, G, N)
 
     y0 = U.T @ alpha_init
     y0 /= (np.linalg.norm(y0) + 1e-12)
@@ -1173,7 +1199,7 @@ def optimize_zonal_alpha_aware(psrpos: np.ndarray, faprob: float, tau: float, Lm
 
     def obj(y: np.ndarray, grad: np.ndarray) -> float:
         alpha = U @ y
-        DP = det_prob_alpha(alpha, L_H0, L_H1, B, G, N,
+        DP = det_prob_alpha(alpha, L_HN, L_HS, B, G, N,
                             faprob=faprob, tau=tau, cdf_method=cdf_method)
         return -float(DP if np.isfinite(DP) else -np.inf)
 
@@ -1181,14 +1207,14 @@ def optimize_zonal_alpha_aware(psrpos: np.ndarray, faprob: float, tau: float, Lm
     try:
         y_opt = opt.optimize(y0)
         alpha = U @ y_opt
-        DP = det_prob_alpha(alpha, L_H0, L_H1, B, G, N,
+        DP = det_prob_alpha(alpha, L_HN, L_HS, B, G, N,
                             faprob=faprob, tau=tau, cdf_method=cdf_method)
         if DP > best["DP"]:
-            D = D_from_alpha(alpha, B, G, N)
-            s_opt = scale_to_fap(L_H0, D, tau, faprob, cdf_method=cdf_method)
+            Q = Q_from_alpha(alpha, B, G, N)
+            s_opt = scale_to_fap(L_HN, Q, tau, faprob, cdf_method=cdf_method)
             best.update(DP=float(DP), y=y_opt.tolist(), scale=float(s_opt))
-            D_unscaled = D
-            D_star = s_opt * D_unscaled
+            Q_unscaled = Q
+            Q_star = s_opt * Q_unscaled
     except nlopt.RoundoffLimited:
         raise
 
@@ -1196,8 +1222,8 @@ def optimize_zonal_alpha_aware(psrpos: np.ndarray, faprob: float, tau: float, Lm
         raise RuntimeError("α-aware zonal optimization failed.")
 
     os.makedirs(outdir, exist_ok=True)
-    np.save(os.path.join(outdir, "D_star.npy"), D_star)
-    np.save(os.path.join(outdir, "D_unscaled.npy"), D_unscaled)
+    np.save(os.path.join(outdir, "Q_star.npy"), Q_star)
+    np.save(os.path.join(outdir, "Q_unscaled.npy"), Q_unscaled)
     atomic_save_json(os.path.join(outdir, "result.json"),
         {
             "mode": "zonal-alpha-aware",
@@ -1212,7 +1238,7 @@ def optimize_zonal_alpha_aware(psrpos: np.ndarray, faprob: float, tau: float, Lm
             "start_from_npmv": bool(start_from_npmv),
         }
     )
-    return D_star, best
+    return Q_star, best
 
 # --- New Mode 2: Zonal + low-rank anisotropy ---
 
@@ -1234,23 +1260,23 @@ def optimize_zonal_lowrank(psrpos: np.ndarray, faprob: float, tau: float, Lmax: 
         start_from_npmv: Initialize projection from NPMV (recommended).
 
     Returns:
-        (D_star, meta) where D_star is scaled to the requested FAP at τ.
+        (Q_star, meta) where Q_star is scaled to the requested FAP at τ.
     """
     cosgamma = np.clip(psrpos @ psrpos.T, -1.0, 1.0)
     np.fill_diagonal(cosgamma, 1.0)
     hdmat = hdcorrmat(psrpos, psrTerm=True)
-    DNP, DNPW, DDEF, L_H0, L_H1 = get_all_filters(1.0, hdmat)
-    N = L_H0 @ L_H0.T
+    QNP, QNPMV, QDEF, L_HN, L_HS = get_all_filters(1.0, hdmat)
+    N = L_HN @ L_HN.T
 
     B = build_legendre_basis(cosgamma, Lmax)
     G = gram_matrix(B, N)
 
-    lowrank = build_lowrank_basis_from_residual(DNP, B, G, N, r=r_lowrank)
+    lowrank = build_lowrank_basis_from_residual(QNP, B, G, N, r=r_lowrank)
     B_all = list(B) + lowrank
     G_all = gram_matrix(B_all, N)
 
     rng = np.random.default_rng(seed)
-    alpha0_z = project_D_to_alpha(DNPW if start_from_npmv else DNP, B, G, N)
+    alpha0_z = project_Q_to_alpha(QNPMV if start_from_npmv else QNP, B, G, N)
     x0 = np.concatenate([alpha0_z, np.zeros(len(lowrank))])
     x0 /= (np.linalg.norm(x0) + 1e-12)
 
@@ -1263,7 +1289,7 @@ def optimize_zonal_lowrank(psrpos: np.ndarray, faprob: float, tau: float, Lmax: 
     opt.set_maxeval(maxeval)
 
     def obj(a: np.ndarray, grad: np.ndarray) -> float:
-        DP = det_prob_alpha(a, L_H0, L_H1, B_all, G_all, N,
+        DP = det_prob_alpha(a, L_HN, L_HS, B_all, G_all, N,
                             faprob=faprob, tau=tau, cdf_method=cdf_method)
         return -float(DP if np.isfinite(DP) else -np.inf)
 
@@ -1271,14 +1297,14 @@ def optimize_zonal_lowrank(psrpos: np.ndarray, faprob: float, tau: float, Lmax: 
 
     try:
         a_opt = opt.optimize(x0)
-        DP = det_prob_alpha(a_opt, L_H0, L_H1, B_all, G_all, N,
+        DP = det_prob_alpha(a_opt, L_HN, L_HS, B_all, G_all, N,
                             faprob=faprob, tau=tau, cdf_method=cdf_method)
         if DP > best["DP"]:
-            D_opt = D_from_alpha(a_opt, B_all, G_all, N)
-            s_opt = scale_to_fap(L_H0, D_opt, tau, faprob, cdf_method=cdf_method)
+            Q_opt = Q_from_alpha(a_opt, B_all, G_all, N)
+            s_opt = scale_to_fap(L_HN, Q_opt, tau, faprob, cdf_method=cdf_method)
             best.update(DP=float(DP), alpha=a_opt.tolist(), scale=float(s_opt))
-            D_unscaled = D_opt
-            D_star = s_opt * D_unscaled
+            Q_unscaled = Q_opt
+            Q_star = s_opt * Q_unscaled
     except nlopt.RoundoffLimited:
         raise
 
@@ -1286,8 +1312,8 @@ def optimize_zonal_lowrank(psrpos: np.ndarray, faprob: float, tau: float, Lmax: 
         raise RuntimeError("zonal-low-rank optimization failed.")
 
     os.makedirs(outdir, exist_ok=True)
-    np.save(os.path.join(outdir, "D_star.npy"), D_star)
-    np.save(os.path.join(outdir, "D_unscaled.npy"), D_unscaled)
+    np.save(os.path.join(outdir, "Q_star.npy"), Q_star)
+    np.save(os.path.join(outdir, "Q_unscaled.npy"), Q_unscaled)
     atomic_save_json(os.path.join(outdir, "result.json"),
         {
             "mode": "zonal-low-rank",
@@ -1303,7 +1329,7 @@ def optimize_zonal_lowrank(psrpos: np.ndarray, faprob: float, tau: float, Lmax: 
             "start_from_npmv": bool(start_from_npmv),
         }
     )
-    return D_star, best
+    return Q_star, best
 
 # --- New Mode 3: Bi-spectral zonal spectrum ---
 
@@ -1325,19 +1351,19 @@ def optimize_bispectral(psrpos: np.ndarray, faprob: float, tau: float, Lmax: int
         start_from_npmv: Initialize the spectral ranking from NPMV projection if True; else NP.
 
     Returns:
-        (D_star, meta) with the best two-level spectrum found.
+        (Q_star, meta) with the best two-level spectrum found.
     """
     cosgamma = np.clip(psrpos @ psrpos.T, -1.0, 1.0)
     np.fill_diagonal(cosgamma, 1.0)
     hdmat = hdcorrmat(psrpos, psrTerm=True)
-    DNP, DNPW, DDEF, L_H0, L_H1 = get_all_filters(1.0, hdmat)
-    N = L_H0 @ L_H0.T
+    QNP, QNPMV, QDEF, L_HN, L_HS = get_all_filters(1.0, hdmat)
+    N = L_HN @ L_HN.T
 
     B = build_legendre_basis(cosgamma, Lmax)
     G = gram_matrix(B, N)
 
     # Spectral score from NP or NPMV projection (init choice)
-    alpha_proj = project_D_to_alpha(DNPW if start_from_npmv else DNP, B, G, N)
+    alpha_proj = project_Q_to_alpha(QNPMV if start_from_npmv else QNP, B, G, N)
     score = np.abs(alpha_proj)
     ell_indices = np.argsort(score)[::-1]
 
@@ -1353,31 +1379,31 @@ def optimize_bispectral(psrpos: np.ndarray, faprob: float, tau: float, Lmax: int
         q_plus = 1.0
         q_minus = - q_plus * (wS / wSc)
         alpha = np.where(S_mask, q_plus, q_minus)
-        D = D_from_alpha(alpha, B, G, N)
-        if D is None:
+        Q = Q_from_alpha(alpha, B, G, N)
+        if Q is None:
             continue
-        s_opt = scale_to_fap(L_H0, D, tau, faprob, cdf_method=cdf_method)
+        s_opt = scale_to_fap(L_HN, Q, tau, faprob, cdf_method=cdf_method)
         if s_opt is None:
             continue
         try:
-            w1 = sl.eigvalsh(L_H1.T @ (s_opt*D) @ L_H1)
+            evals_S = sl.eigvalsh(L_HS.T @ (s_opt*Q) @ L_HS)
         except Exception:
             continue
-        cdf1 = gx2cdf_from_eigs(w1, tau, method=cdf_method)
-        if not np.isfinite(cdf1):
+        cdf_S = gx2cdf_from_eigs(evals_S, tau, method=cdf_method)
+        if not np.isfinite(cdf_S):
             continue
-        DP = 1.0 - float(cdf1)
+        DP = 1.0 - float(cdf_S)
         if DP > best["DP"]:
             best.update(DP=float(DP), alpha=alpha.tolist(), scale=float(s_opt), k=int(k))
-            D_unscaled = D
-            D_star = s_opt * D_unscaled
+            Q_unscaled = Q
+            Q_star = s_opt * Q_unscaled
 
     if best["alpha"] is None:
         raise RuntimeError("bi-spectral search found no valid candidate (try larger kmax/Lmax).")
 
     os.makedirs(outdir, exist_ok=True)
-    np.save(os.path.join(outdir, "D_star.npy"), D_star)
-    np.save(os.path.join(outdir, "D_unscaled.npy"), D_unscaled)
+    np.save(os.path.join(outdir, "Q_star.npy"), Q_star)
+    np.save(os.path.join(outdir, "Q_unscaled.npy"), Q_unscaled)
     atomic_save_json(os.path.join(outdir, "result.json"),
         {
             "mode": "bi-spectral",
@@ -1393,26 +1419,26 @@ def optimize_bispectral(psrpos: np.ndarray, faprob: float, tau: float, Lmax: int
             "start_from_npmv": bool(start_from_npmv),
         }
     )
-    return D_star, best
+    return Q_star, best
 
 # ===================== New: Incremental FULL optimization =====================
 
-def _embed_old_into_new(D_old: np.ndarray, n_new: int) -> np.ndarray:
+def _embed_old_into_new(Q_old: np.ndarray, n_new: int) -> np.ndarray:
     """Embed a smaller symmetric matrix into the top-left block of a larger one.
 
     Args:
-        D_old: (n_old, n_old) matrix.
+        Q_old: (n_old, n_old) matrix.
         n_new: New larger size (n_new ≥ n_old).
 
     Returns:
-        (n_new, n_new) matrix with D_old in the top-left block; zero elsewhere
+        (n_new, n_new) matrix with Q_old in the top-left block; zero elsewhere
         (diagonal zeroed as well).
     """
-    n_old = D_old.shape[0]
-    D_new = np.zeros((n_new, n_new))
-    D_new[:n_old, :n_old] = D_old
-    np.fill_diagonal(D_new, 0.0)
-    return D_new
+    n_old = Q_old.shape[0]
+    Q_new = np.zeros((n_new, n_new))
+    Q_new[:n_old, :n_old] = Q_old
+    np.fill_diagonal(Q_new, 0.0)
+    return Q_new
 
 
 def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float, seed: int,
@@ -1426,7 +1452,7 @@ def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float
       1) Solve the full problem for n = inc_start (standard 'full' optimization).
       2) For n ← n + inc_step up to target:
          (a) Initialize by embedding previous optimal solution into n×n and
-             filling *new* entries using NPMV (off-diagonal NP) as a guess.
+             filling *new* entries using the NPMV filter as a guess.
          (b) Optimize only the newly added parameters (old ones frozen).
          (c) Optimize all parameters jointly.
       At each n, also compute DP(NPMV). If our optimized DP < DP(NPMV), we WARN
@@ -1446,7 +1472,7 @@ def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float
         start_from_npmv: Whether to initialize with NPMV/DF at the first stage.
 
     Returns:
-        (D_star, meta) for the final size.
+        (Q_star, meta) for the final size.
     """
     rng = np.random.default_rng(seed)
     n_target = psrpos.shape[0]
@@ -1458,15 +1484,15 @@ def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float
     # ---- Stage 0: solve for n0 using standard full optimization ----
     sub_psr = psrpos[:n0, :]
     hdmat = hdcorrmat(sub_psr, psrTerm=True)
-    DNP, DNPW, DDEF, L0, L1 = get_all_filters(1.0, hdmat)
-    N = L0 @ L0.T
+    QNP, QNPMV, QDEF, LN, LS = get_all_filters(1.0, hdmat)
+    N = LN @ LN.T
 
     # DP for NPMV at n0 (same backend)
-    DP_npmv_n0 = dp_from_normalized_matrix(DNPW, L0, L1, faprob=faprob, tau=tau, cdf_method=cdf_method)
+    DP_npmv_n0 = dp_from_normalized_matrix(QNPMV, LN, LS, faprob=faprob, tau=tau, cdf_method=cdf_method)
 
-    # Stage-0 init: NPMV or classic
-    D_start = DNPW.copy() if start_from_npmv else norm_filter_white(DDEF.copy())
-    x0 = get_lower_triangular_elements(D_start)
+    # Stage-0 init: NPMV or DF (deflection)
+    Q_start = QNPMV.copy() if start_from_npmv else norm_filter_white(QDEF.copy())
+    x0 = get_lower_triangular_elements(Q_start)
 
     m0 = n0*(n0-1)//2
     opt0 = nlopt.opt(nlopt.LN_BOBYQA, m0)
@@ -1476,14 +1502,14 @@ def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float
     opt0.set_maxeval(maxeval)
 
     def obj0(x: np.ndarray, grad: np.ndarray) -> float:
-        return -det_prob(x, L0, L1, faprob=faprob, tau=tau, cdf_method=cdf_method)
+        return -det_prob(x, LN, LS, faprob=faprob, tau=tau, cdf_method=cdf_method)
 
     opt0.set_min_objective(obj0)
     x_prev = opt0.optimize(x0)
-    DP0 = det_prob(x_prev, L0, L1, faprob=faprob, tau=tau, cdf_method=cdf_method)
+    DP0 = det_prob(x_prev, LN, LS, faprob=faprob, tau=tau, cdf_method=cdf_method)
 
-    # Keep a copy of previous D (matrix form) for embedding
-    D_prev = construct_decision_matrix(x_prev, normalize=False)
+    # Keep a copy of previous Q (matrix form) for embedding
+    Q_prev = construct_filter_matrix(x_prev, normalize=False)
 
     # Report and warn if below NPMV, but DO NOT stop.
     print(f"[increment] n={n0}: base full optimization  DP={DP0:.6e}  vs NPMV={DP_npmv_n0:.6e}")
@@ -1499,20 +1525,20 @@ def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float
         n_cur = min(n_target, n_prev + step)
         sub_psr = psrpos[:n_cur, :]
         hdmat = hdcorrmat(sub_psr, psrTerm=True)
-        DNP, DNPW, DDEF, L0, L1 = get_all_filters(1.0, hdmat)
-        N = L0 @ L0.T
+        QNP, QNPMV, QDEF, LN, LS = get_all_filters(1.0, hdmat)
+        N = LN @ LN.T
 
         # DP for NPMV at n_cur (same backend)
-        DP_npmv_cur = dp_from_normalized_matrix(DNPW, L0, L1, faprob=faprob, tau=tau, cdf_method=cdf_method)
+        DP_npmv_cur = dp_from_normalized_matrix(QNPMV, LN, LS, faprob=faprob, tau=tau, cdf_method=cdf_method)
 
-        # Seed: embed previous solution; fill new entries using DNPW (NPMV)
-        D_seed = _embed_old_into_new(D_prev, n_cur)
+        # Seed: embed previous solution; fill new entries using QNPMV (NPMV)
+        Q_seed = _embed_old_into_new(Q_prev, n_cur)
         i_tril, j_tril = np.tril_indices(n_cur, k=-1)
         old_mask = (i_tril < n_prev) & (j_tril < n_prev)
         new_mask = ~old_mask
 
-        x_seed = get_lower_triangular_elements(D_seed)
-        x_guess_np = get_lower_triangular_elements(DNPW)
+        x_seed = get_lower_triangular_elements(Q_seed)
+        x_guess_np = get_lower_triangular_elements(QNPMV)
         x_seed[new_mask] = x_guess_np[new_mask]  # keep old, fill new from NPMV
 
         # --- Step 1: optimize only newly added parameters ---
@@ -1526,7 +1552,7 @@ def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float
         def obj1(x_new: np.ndarray, grad: np.ndarray) -> float:
             x_full = x_seed.copy()
             x_full[new_mask] = x_new
-            return -det_prob(x_full, L0, L1, faprob=faprob, tau=tau, cdf_method=cdf_method)
+            return -det_prob(x_full, LN, LS, faprob=faprob, tau=tau, cdf_method=cdf_method)
 
         opt1.set_min_objective(obj1)
         x_new0 = x_seed[new_mask].copy()
@@ -1535,15 +1561,15 @@ def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float
         # Construct full vector after step 1 and evaluate
         x_step1 = x_seed.copy()
         x_step1[new_mask] = x_new_opt
-        DP1 = det_prob(x_step1, L0, L1, faprob=faprob, tau=tau, cdf_method=cdf_method)
+        DP1 = det_prob(x_step1, LN, LS, faprob=faprob, tau=tau, cdf_method=cdf_method)
 
         # For reporting, compute scale s1 of the normalized matrix
-        D1_mat = construct_decision_matrix(x_step1, normalize=False)
-        nrm2 = np.trace(D1_mat @ N @ D1_mat @ N)
+        Q1_mat = construct_filter_matrix(x_step1, normalize=False)
+        nrm2 = np.trace(Q1_mat @ N @ Q1_mat @ N)
         s1 = None
         if np.isfinite(nrm2) and nrm2 > 0:
-            D1n = D1_mat / np.sqrt(nrm2)
-            s_tmp = scale_to_fap(L0, D1n, tau, faprob, cdf_method=cdf_method)
+            Q1n = Q1_mat / np.sqrt(nrm2)
+            s_tmp = scale_to_fap(LN, Q1n, tau, faprob, cdf_method=cdf_method)
             s1 = float(s_tmp) if (s_tmp is not None and np.isfinite(s_tmp)) else None
 
         print(f"[increment] n={n_cur}: step1 (new-only, d_free={d_free})  "
@@ -1559,22 +1585,22 @@ def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float
         opt2.set_maxeval(maxeval)
 
         def obj2(x: np.ndarray, grad: np.ndarray) -> float:
-            return -det_prob(x, L0, L1, faprob=faprob, tau=tau, cdf_method=cdf_method)
+            return -det_prob(x, LN, LS, faprob=faprob, tau=tau, cdf_method=cdf_method)
 
         opt2.set_min_objective(obj2)
         x2_opt = opt2.optimize(x_step1)
-        DP2 = det_prob(x2_opt, L0, L1, faprob=faprob, tau=tau, cdf_method=cdf_method)
+        DP2 = det_prob(x2_opt, LN, LS, faprob=faprob, tau=tau, cdf_method=cdf_method)
 
         # Update previous solution for next increment
         x_prev = x2_opt
-        D_prev = construct_decision_matrix(x_prev, normalize=False)
+        Q_prev = construct_filter_matrix(x_prev, normalize=False)
 
         # Final scale at this stage (for reporting)
-        nrm2 = np.trace(D_prev @ N @ D_prev @ N)
+        nrm2 = np.trace(Q_prev @ N @ Q_prev @ N)
         s2 = None
         if np.isfinite(nrm2) and nrm2 > 0:
-            Dn = D_prev / np.sqrt(nrm2)
-            s_tmp = scale_to_fap(L0, Dn, tau, faprob, cdf_method=cdf_method)
+            Qn = Q_prev / np.sqrt(nrm2)
+            s_tmp = scale_to_fap(LN, Qn, tau, faprob, cdf_method=cdf_method)
             s2 = float(s_tmp) if (s_tmp is not None and np.isfinite(s_tmp)) else None
 
         print(f"[increment] n={n_cur}: step2 (all-free)  "
@@ -1596,29 +1622,29 @@ def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float
         n_prev = n_cur
 
     # ---- Final output at last processed size ----
-    n_final = D_prev.shape[0]  # size of the last optimized matrix
+    n_final = Q_prev.shape[0]  # size of the last optimized matrix
     hdmat = hdcorrmat(psrpos[:n_final, :], psrTerm=True)
-    DNP, DNPW, DDEF, L0, L1 = get_all_filters(1.0, hdmat)
-    N = L0 @ L0.T
+    QNP, QNPMV, QDEF, LN, LS = get_all_filters(1.0, hdmat)
+    N = LN @ LN.T
 
     # Compute DP(NPMV) at final size (same backend)
-    DP_npmv_final = dp_from_normalized_matrix(DNPW, L0, L1, faprob=faprob, tau=tau, cdf_method=cdf_method)
+    DP_npmv_final = dp_from_normalized_matrix(QNPMV, LN, LS, faprob=faprob, tau=tau, cdf_method=cdf_method)
 
-    nrm2 = np.trace(D_prev @ N @ D_prev @ N)
+    nrm2 = np.trace(Q_prev @ N @ Q_prev @ N)
     if not np.isfinite(nrm2) or nrm2 <= 0:
-        raise RuntimeError("Final D normalization failed in incremental path.")
-    D_unscaled = D_prev / np.sqrt(nrm2)
-    s_final = scale_to_fap(L0, D_unscaled, tau, faprob, cdf_method=cdf_method)
+        raise RuntimeError("Final Q normalization failed in incremental path.")
+    Q_unscaled = Q_prev / np.sqrt(nrm2)
+    s_final = scale_to_fap(LN, Q_unscaled, tau, faprob, cdf_method=cdf_method)
     if s_final is None or not np.isfinite(s_final):
         raise RuntimeError("Final scaling to FAP failed in incremental path.")
-    D_star = float(s_final) * D_unscaled
+    Q_star = float(s_final) * Q_unscaled
 
-    DP_final = det_prob(get_lower_triangular_elements(D_prev), L0, L1,
+    DP_final = det_prob(get_lower_triangular_elements(Q_prev), LN, LS,
                         faprob=faprob, tau=tau, cdf_method=cdf_method)
 
     os.makedirs(outdir, exist_ok=True)
-    np.save(os.path.join(outdir, "D_star.npy"), D_star)
-    np.save(os.path.join(outdir, "D_unscaled.npy"), D_unscaled)
+    np.save(os.path.join(outdir, "Q_star.npy"), Q_star)
+    np.save(os.path.join(outdir, "Q_unscaled.npy"), Q_unscaled)
     atomic_save_json(os.path.join(outdir, "result.json"),
         {
             "mode": "full-incremental",
@@ -1636,7 +1662,7 @@ def optimize_with_full_incremental(psrpos: np.ndarray, faprob: float, tau: float
             "start_from_npmv": bool(start_from_npmv),
         }
     )
-    return D_star, {"DP": float(DP_final), "scale": float(s_final)}
+    return Q_star, {"DP": float(DP_final), "scale": float(s_final)}
 
 # ===================== FULL (with multiple optimizers) =====================
 
@@ -1662,7 +1688,7 @@ def optimize_with_full(psrpos: np.ndarray, faprob: float, tau: float, seed: int,
         maxeval: Max function evaluations for BOBYQA.
         bound: Absolute bound on parameters.
         cdf_method: "analytic" or "imhof".
-        start_from_npmv: Use NPMV (off-diagonal NP) init if no start-json/resume.
+        start_from_npmv: Use NPMV init if no start-json/resume (else DF).
         resume: If True, start from <outdir>/x_opt.json if compatible.
         optimizer: One of {"bobyqa","subspace_bobyqa","nes","spsa","isres_then_bobyqa"}.
         subspace_size: Subspace size (subspace_bobyqa).
@@ -1677,12 +1703,12 @@ def optimize_with_full(psrpos: np.ndarray, faprob: float, tau: float, seed: int,
         polish_evals: Eval budget for polish.
 
     Returns:
-        (D_star, meta) where D_star is scaled to the requested FAP at τ.
+        (Q_star, meta) where Q_star is scaled to the requested FAP at τ.
     """
     hdmat = hdcorrmat(psrpos, psrTerm=True)
     h_opt = 1.0
-    DNP, DNPW, DDEF, L_H0, L_H1 = get_all_filters(h_opt, hdmat)
-    N = L_H0 @ L_H0.T
+    QNP, QNPMV, QDEF, L_HN, L_HS = get_all_filters(h_opt, hdmat)
+    N = L_HN @ L_HN.T
 
     n = psrpos.shape[0]
     m = n*(n-1)//2
@@ -1736,12 +1762,12 @@ def optimize_with_full(psrpos: np.ndarray, faprob: float, tau: float, seed: int,
                     warnings.warn(f"Failed to read legacy start-json {legacy_json}: {e}")
 
     if x0 is None:
-        D0 = DNPW.copy() if start_from_npmv else norm_filter_white(DDEF.copy())
-        x0 = get_lower_triangular_elements(D0)
-        print(f"[full] Using {'NPMV' if start_from_npmv else 'classic'} initialization.")
+        Q0 = QNPMV.copy() if start_from_npmv else norm_filter_white(QDEF.copy())
+        x0 = get_lower_triangular_elements(Q0)
+        print(f"[full] Using {'NPMV' if start_from_npmv else 'DF'} initialization.")
 
     x0 = np.clip(x0, -bound, +bound)
-    eval_dp = _dp_obj_factory(L_H0, L_H1, faprob, tau, cdf_method)
+    eval_dp = _dp_obj_factory(L_HN, L_HS, faprob, tau, cdf_method)
     rng = np.random.default_rng(seed)
 
     # ---------- optimizer dispatch ----------
@@ -1902,7 +1928,7 @@ def optimize_with_full(psrpos: np.ndarray, faprob: float, tau: float, seed: int,
 
     # ---------- finalize ----------
     return _finalize_and_save_full(
-        x_best=x_best, L_H0=L_H0, L_H1=L_H1, N=N, faprob=faprob, tau=tau,
+        x_best=x_best, L_HN=L_HN, L_HS=L_HS, N=N, faprob=faprob, tau=tau,
         cdf_method=cdf_method, outdir=outdir, seed=seed, m=m, maxeval=maxeval,
         bound=bound, start_json=start_json, start_from_npmv=start_from_npmv,
         resume=resume, optimizer_name=optimizer, extra_meta=extra_meta
@@ -1931,11 +1957,11 @@ def main() -> None:
     ], default="full",
         help="Optimization mode (see description; 'original' and 'basis' map to new names).")
     parser.add_argument("--cdf", choices=["analytic", "imhof"], default="analytic",
-                        help="CDF evaluator to use for FAP scaling and DP (default: analytic).")
+                        help="CDF evaluator to use for FAP scaling and the detection probability DP (default: analytic).")
 
     # init from NPMV toggle (default True)
     parser.add_argument("--start_from_npmv", dest="start_from_npmv", action="store_true",
-                        help="Initialize from NPMV (off-diagonal NP) where applicable (default).")
+                        help="Initialize from the NPMV filter where applicable (default).")
     parser.add_argument("--no_start_from_npmv", dest="start_from_npmv", action="store_false",
                         help="Disable NPMV-based initialization.")
     parser.set_defaults(start_from_npmv=True)
@@ -2015,12 +2041,12 @@ def main() -> None:
         args.mode = "legendre"
 
     if args.mode == "legendre":
-        D_star, best = optimize_with_legendre(psrpos, faprob=args.faprob, tau=args.tau,
+        Q_star, best = optimize_with_legendre(psrpos, faprob=args.faprob, tau=args.tau,
                                               Lmax=args.Lmax, n_starts=args.starts,
                                               seed=args.seed, outdir=args.outdir,
                                               cdf_method=args.cdf, start_from_npmv=args.start_from_npmv)
     elif args.mode == "full":
-        D_star, best = optimize_with_full(psrpos, faprob=args.faprob, tau=args.tau,
+        Q_star, best = optimize_with_full(psrpos, faprob=args.faprob, tau=args.tau,
                                           seed=args.seed, outdir=args.outdir,
                                           start_json=args.start_json,
                                           maxeval=args.maxeval, bound=args.bound,
@@ -2035,7 +2061,7 @@ def main() -> None:
                                           isres_evals=args.isres_evals,
                                           polish=args.polish, polish_evals=args.polish_evals)
     elif args.mode == "full-incremental":
-        D_star, best = optimize_with_full_incremental(psrpos, faprob=args.faprob, tau=args.tau,
+        Q_star, best = optimize_with_full_incremental(psrpos, faprob=args.faprob, tau=args.tau,
                                                       seed=args.seed, outdir=args.outdir,
                                                       maxeval=args.maxeval, bound=args.bound,
                                                       cdf_method=args.cdf,
@@ -2043,18 +2069,18 @@ def main() -> None:
                                                       inc_step=args.inc_step,
                                                       start_from_npmv=args.start_from_npmv)
     elif args.mode == "zonal-alpha-aware":
-        D_star, best = optimize_zonal_alpha_aware(psrpos, faprob=args.faprob, tau=args.tau,
+        Q_star, best = optimize_zonal_alpha_aware(psrpos, faprob=args.faprob, tau=args.tau,
                                                   Lmax=args.Lmax, seed=args.seed,
                                                   outdir=args.outdir, maxeval=args.maxeval,
                                                   cdf_method=args.cdf, start_from_npmv=args.start_from_npmv)
     elif args.mode == "zonal-low-rank":
-        D_star, best = optimize_zonal_lowrank(psrpos, faprob=args.faprob, tau=args.tau,
+        Q_star, best = optimize_zonal_lowrank(psrpos, faprob=args.faprob, tau=args.tau,
                                               Lmax=args.Lmax, r_lowrank=args.r_lowrank,
                                               seed=args.seed, outdir=args.outdir,
                                               maxeval=args.maxeval, cdf_method=args.cdf,
                                               start_from_npmv=args.start_from_npmv)
     elif args.mode == "bi-spectral":
-        D_star, best = optimize_bispectral(psrpos, faprob=args.faprob, tau=args.tau,
+        Q_star, best = optimize_bispectral(psrpos, faprob=args.faprob, tau=args.tau,
                                            Lmax=args.Lmax, kmax=args.kmax,
                                            seed=args.seed, outdir=args.outdir,
                                            cdf_method=args.cdf, start_from_npmv=args.start_from_npmv)
